@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hacker Face</title>
+<style>
+  :root {
+    --fg: #39ff88;
+    --fg-dim: #1d8f55;
+    --cyan: #00e5ff;
+    --bg: #000;
+    --mono: "Consolas", "Menlo", "DejaVu Sans Mono", "Courier New", monospace;
+  }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: var(--bg); color: var(--fg); font-family: var(--mono);
+  }
+
+  /* ---- Rendering layers ---- */
+  #stage { position: fixed; inset: 0; will-change: transform; }
+  #stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+
+  /* Scanlines + vignette are pure CSS (cheap, composited by the GPU) */
+  .scanlines {
+    position: fixed; inset: 0; pointer-events: none; z-index: 5;
+    background: repeating-linear-gradient(to bottom,
+      rgba(0,0,0,0) 0px, rgba(0,0,0,0) 2px, rgba(0,0,0,0.22) 3px, rgba(0,0,0,0) 4px);
+    mix-blend-mode: multiply;
+  }
+  .scanlines::after {
+    /* slow moving bright band, CRT-style */
+    content: ""; position: absolute; left: 0; right: 0; height: 18vh; top: -20vh;
+    background: linear-gradient(to bottom, rgba(120,255,180,0), rgba(120,255,180,0.05), rgba(120,255,180,0));
+    animation: sweep 7s linear infinite;
+  }
+  @keyframes sweep { to { transform: translateY(140vh); } }
+  .vignette {
+    position: fixed; inset: 0; pointer-events: none; z-index: 6;
+    background: radial-gradient(ellipse at center, rgba(0,0,0,0) 55%, rgba(0,0,0,0.75) 100%);
+  }
+
+  /* Hidden webcam element: kept in the DOM and "visible" so Chrome keeps decoding frames */
+  #cam { position: absolute; width: 2px; height: 2px; opacity: 0; pointer-events: none; left: 0; top: 0; }
+
+  /* ---- Start overlay ---- */
+  #start {
+    position: fixed; inset: 0; z-index: 20; display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.55); padding: 16px;
+  }
+  #start .box {
+    max-width: 560px; width: 100%; border: 1px solid var(--fg-dim); background: rgba(0,10,4,0.85);
+    padding: 28px; box-shadow: 0 0 30px rgba(57,255,136,0.15), inset 0 0 30px rgba(57,255,136,0.05);
+  }
+  #start h1 { margin: 0 0 6px; font-size: 26px; letter-spacing: 4px; color: var(--fg); text-shadow: 0 0 10px var(--fg); }
+  #start p { margin: 8px 0; color: #9fe8bf; font-size: 13px; line-height: 1.55; }
+  #start kbd { border: 1px solid var(--fg-dim); padding: 0 5px; color: var(--cyan); font-family: var(--mono); }
+  #startBtn {
+    margin-top: 18px; font-family: var(--mono); font-size: 18px; letter-spacing: 3px;
+    padding: 12px 30px; background: transparent; color: var(--fg); border: 1px solid var(--fg);
+    cursor: pointer; text-shadow: 0 0 8px var(--fg); box-shadow: 0 0 14px rgba(57,255,136,0.35);
+  }
+  #startBtn:hover { background: rgba(57,255,136,0.12); }
+  #startBtn:disabled { opacity: 0.5; cursor: wait; }
+  #status { margin-top: 14px; min-height: 1.4em; color: var(--cyan); font-size: 13px; }
+
+  /* ---- Settings panel (press S) ---- */
+  #settings {
+    position: fixed; top: 50%; right: 24px; transform: translateY(-50%); z-index: 15;
+    width: 300px; max-width: calc(100vw - 32px); padding: 16px 18px;
+    background: rgba(0,8,4,0.9); border: 1px solid var(--fg-dim);
+    box-shadow: 0 0 24px rgba(57,255,136,0.2); font-size: 13px;
+  }
+  #settings h2 { margin: 0 0 12px; font-size: 14px; letter-spacing: 2px; }
+  #settings h2 small { color: var(--fg-dim); font-weight: normal; letter-spacing: 0; }
+  #settings label { display: block; margin: 12px 0 0; color: #b6f5cf; }
+  #settings label span { float: right; color: var(--cyan); }
+  #settings input[type=range] { width: 100%; margin-top: 6px; accent-color: var(--fg); }
+  #settings label.chk { display: flex; gap: 8px; align-items: center; }
+  #settings .hint { color: var(--fg-dim); font-size: 11px; margin-top: 4px; line-height: 1.4; }
+  #settings button {
+    margin-top: 14px; font-family: var(--mono); background: transparent; color: var(--fg);
+    border: 1px solid var(--fg-dim); padding: 6px 12px; cursor: pointer;
+  }
+  .hidden { display: none !important; }
+
+  @media (max-width: 480px) {
+    #settings { right: 16px; left: 16px; width: auto; }
+    #start .box { padding: 18px; }
+  }
+</style>
+</head>
+<body>
+  <div id="stage">
+    <canvas id="code"></canvas>  <!-- layer 1: animated code background -->
+    <canvas id="fx"></canvas>    <!-- layers 2-4: ghost face, color mask/particles, HUD -->
+  </div>
+  <div class="scanlines"></div>
+  <div class="vignette"></div>
+  <video id="cam" playsinline muted autoplay></video>
+
+  <div id="start">
+    <div class="box">
+      <h1>HACKER//FACE</h1>
+      <p>Live neural face-mesh mask over your webcam. <b>Clap</b> (or slap a hand fast across your face)
+         to shatter the mask. Clap again to reassemble it with a new palette.</p>
+      <p>Needs <b>camera + microphone</b> access. Nothing leaves your machine.</p>
+      <p><kbd>SPACE</kbd> trigger &nbsp; <kbd>F</kbd> fullscreen &nbsp; <kbd>D</kbd> debug &nbsp; <kbd>S</kbd> settings</p>
+      <button id="startBtn">[ START ]</button>
+      <div id="status"></div>
+    </div>
+  </div>
+
+  <div id="settings" class="hidden">
+    <h2>// SETTINGS <small>[S] close</small></h2>
+    <label>Clap sensitivity <span id="v-sensitivity"></span>
+      <input type="range" id="sensitivity" min="1" max="10" step="0.5"></label>
+    <div class="hint">Higher = triggers on quieter claps. Lower it if speech/noise triggers it. Use <b>D</b> to see the meter.</div>
+    <label>Ghost face opacity <span id="v-ghostOpacity"></span>
+      <input type="range" id="ghostOpacity" min="0" max="100" step="1"></label>
+    <label>Particle count <span id="v-particleCount"></span>
+      <input type="range" id="particleCount" min="100" max="1700" step="50"></label>
+    <label>Code speed <span id="v-codeSpeed"></span>
+      <input type="range" id="codeSpeed" min="0.2" max="3" step="0.1"></label>
+    <label class="chk"><input type="checkbox" id="micTrigger"> Clap (microphone) trigger</label>
+    <label class="chk"><input type="checkbox" id="slapTrigger"> Hand-slap trigger</label>
+    <button id="resetSettings">Reset defaults</button>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
