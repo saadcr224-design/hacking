@@ -730,72 +730,73 @@ function drawIncoming(ctx) {
   ctx.globalAlpha = 1;
 }
 
-// ---- 7c. ROBOT: lives on the side opposite the code panel, driven by your hand.
-//      A clap makes it wind up, grow huge and punch the screen: the glass cracks. ----
+// ---- 7c. ROBOT: an armored humanoid mech standing on the side opposite the code panel.
+//      Its arms mirror yours: raise your hand and its arm goes up, lower it and it comes down,
+//      make a fist and it makes a fist. A clap makes it grow and punch the screen. ----
 const robot = {
-  x: 0, y: 0, vx: 0, vy: 0,          // body position (spring-follows the target)
-  lean: 0,
-  fist: 0,                           // 0 = open hand, 1 = closed fist (mirrors your hand)
-  reach: { x: 0, y: 0 },             // where the front arm's hand points (screen px)
+  x: 0,
+  // arm pose as a direction * extension (0..1) from the robot's shoulder, in robot space
+  arms: { L: { x: -0.25, y: 0.92, fist: 0, live: false }, R: { x: 0.25, y: 0.92, fist: 0, live: false } },
+  look: { x: 0, y: 0 },
   phase: 'idle', pt: 0,              // idle | windup | punch | recover
   impact: { x: 0, y: 0 },
   onImpact: null,
 };
 const PUNCH_WINDUP = 0.32, PUNCH_HIT = 0.2, PUNCH_RECOVER = 0.7;
 
-/** Screen region the robot lives in: the far side of the camera area from the code panel. */
-function robotZone() {
-  const zw = Math.max(220, (camR - camL) * 0.34);
-  return settings.codeRight ? { l: camL, r: camL + zw } : { l: camR - zw, r: camR };
+const robotUnit = () => Math.max(14, H * 0.5 / 8.8);          // body is ~8.8 units tall, half the screen
+const robotFacing = () => (settings.codeRight ? 1 : -1);       // +1: robot stands left, faces right
+const robotGround = () => H * 0.985;
+function robotBaseX() {
+  const u = robotUnit();
+  return settings.codeRight ? camL + u * 4.4 : camR - u * 4.4;
 }
-const robotUnit = () => Math.max(16, Math.min(H * 0.07, (robotZone().r - robotZone().l) * 0.13));
-const robotFacing = () => (settings.codeRight ? 1 : -1);    // +1 = robot faces right (toward screen center)
 
-function controlHand() {
-  let best = null;
-  for (const h of hands.list) if (h.seen && (!best || h.alpha > best.alpha)) best = h;
-  return best;
+/** The hand that drives the robot's arm on each side (mirror view: your screen-left hand -> its screen-left arm). */
+function armHands() {
+  const seen = hands.list.filter((h) => h.seen).sort((a, b) => a.rx - b.rx);
+  if (seen.length >= 2) return { L: seen[0], R: seen[seen.length - 1] };
+  if (seen.length === 1) {
+    const mid = face.present ? face.cx : (camL + camR) / 2;
+    return seen[0].rx < mid ? { L: seen[0], R: null } : { L: null, R: seen[0] };
+  }
+  return { L: null, R: null };
 }
 
 /** Start the punch; `onImpact` runs when the fist hits the glass. Returns false if busy. */
 function robotPunch(onImpact) {
   if (robot.phase !== 'idle') return false;
   robot.phase = 'windup'; robot.pt = 0; robot.onImpact = onImpact;
-  // punch lands on your face if we have one, else the middle of the camera area
   robot.impact.x = face.present ? face.cx : (camL + camR) / 2;
   robot.impact.y = face.present ? face.cy : H * 0.45;
   return true;
 }
 
 function updateRobot(dt) {
-  const z = robotZone(), u = robotUnit();
-  const h = controlHand();
-  // target: your hand's position mapped into the robot's zone
-  let tx = (z.l + z.r) / 2, ty = H * 0.55 + Math.sin(clock * 1.6) * u * 0.4;
-  if (h) {
-    tx = z.l + (h.rx / W) * (z.r - z.l);
-    ty = clamp(h.ry, H * 0.3, H - u * 5);
-    robot.fist = lerp(robot.fist, h.fist ? 1 : 0, 1 - Math.pow(0.001, dt));
-    robot.reach.x = h.pts[9][0]; robot.reach.y = h.pts[9][1];
-  } else {
-    robot.fist = lerp(robot.fist, 0, 1 - Math.pow(0.05, dt));
-    robot.reach.x = (camL + camR) / 2; robot.reach.y = H * 0.5 + Math.sin(clock) * 60;
+  const fd = robotFacing();
+  const tx = robotBaseX() + (robot.phase !== 'idle' ? fd * robotUnit() * 1.2 : 0);
+  robot.x = robot.x ? lerp(robot.x, tx, 1 - Math.pow(0.002, dt)) : tx;
+
+  // Mirror your arms: direction from your (estimated) shoulder to your hand.
+  const hs = armHands();
+  const k = 1 - Math.pow(0.0004, dt);
+  for (const [key, side] of [['L', -1], ['R', 1]]) {
+    const A = robot.arms[key], h = hs[key];
+    let tx2 = side * 0.25, ty2 = 0.92, fist = 0;                       // relaxed, hanging
+    if (h) {
+      const fw = face.has ? face.w : W * 0.12;
+      const sx = face.has ? face.cx + side * fw * 0.9 : (camL + camR) / 2 + side * W * 0.1;
+      const sy = face.has ? face.cy + face.h * 0.95 : H * 0.7;
+      const dx = h.rx - sx, dy = h.ry - sy, d = Math.hypot(dx, dy) || 1;
+      const reach = clamp(d / (fw * 2.4), 0.45, 1);
+      tx2 = (dx / d) * reach; ty2 = (dy / d) * reach; fist = h.fist ? 1 : 0;
+    }
+    A.live = !!h;
+    A.x += (tx2 - A.x) * k; A.y += (ty2 - A.y) * k; A.fist += (fist - A.fist) * k;
   }
-  if (robot.phase !== 'idle') {                 // during the punch the robot steps toward the target
-    tx = lerp((z.l + z.r) / 2, robot.impact.x, 0.25); ty = H * 0.55;
-    robot.fist = 1;
-  }
-  // keep the whole robot on screen, even at its biggest wind-up size
-  const half = u * 2.2 * robotScale();
-  tx = clamp(tx, Math.min(z.l + half, W / 2), Math.max(z.r - half, W / 2));
-  ty = clamp(ty, u * 3.8 * robotScale(), H - u * 3.2 * robotScale());
-  if (!robot.x) { robot.x = tx; robot.y = ty; }
-  // critically-damped-ish spring
-  const k = 60, d = 12;
-  robot.vx += ((tx - robot.x) * k - robot.vx * d) * dt;
-  robot.vy += ((ty - robot.y) * k - robot.vy * d) * dt;
-  robot.x += robot.vx * dt; robot.y += robot.vy * dt;
-  robot.lean = lerp(robot.lean, clamp(robot.vx / 900, -0.35, 0.35), 0.2);
+  const lh = hs.L || hs.R;
+  robot.look.x = lh ? lh.rx : (face.present ? face.cx : (camL + camR) / 2);
+  robot.look.y = lh ? lh.ry : (face.present ? face.cy : H * 0.4);
 
   if (robot.phase === 'idle') return;
   robot.pt += dt;
@@ -808,18 +809,18 @@ function updateRobot(dt) {
   } else if (robot.phase === 'recover' && robot.pt >= PUNCH_RECOVER) { robot.phase = 'idle'; robot.pt = 0; }
 }
 
-/** Robot body scale: grows during the wind-up, peaks on the hit, shrinks back. */
+/** Robot scale: grows during the wind-up, peaks on the hit, settles back. Feet stay planted. */
 function robotScale() {
-  if (robot.phase === 'windup') return 1 + 0.9 * easeOutCubic(robot.pt / PUNCH_WINDUP);
-  if (robot.phase === 'punch') return 1.9 + 0.4 * (robot.pt / PUNCH_HIT);
-  if (robot.phase === 'recover') return lerp(2.3, 1, easeOutCubic(robot.pt / PUNCH_RECOVER));
+  if (robot.phase === 'windup') return 1 + 0.5 * easeOutCubic(robot.pt / PUNCH_WINDUP);
+  if (robot.phase === 'punch') return 1.5 + 0.2 * (robot.pt / PUNCH_HIT);
+  if (robot.phase === 'recover') return lerp(1.7, 1, easeOutCubic(robot.pt / PUNCH_RECOVER));
   return 1;
 }
 
 function metal(ctx, x0, y0, x1, y1, dark = false) {
   const g = ctx.createLinearGradient(x0, y0, x1, y1);
-  if (dark) { g.addColorStop(0, '#5b6572'); g.addColorStop(0.5, '#2a3038'); g.addColorStop(1, '#14181d'); }
-  else { g.addColorStop(0, '#f4f8fc'); g.addColorStop(0.45, '#a9b4c2'); g.addColorStop(1, '#3d4550'); }
+  if (dark) { g.addColorStop(0, '#606b78'); g.addColorStop(0.5, '#2b3139'); g.addColorStop(1, '#12161a'); }
+  else { g.addColorStop(0, '#f5f9fd'); g.addColorStop(0.35, '#b9c3cf'); g.addColorStop(0.7, '#6d7784'); g.addColorStop(1, '#353c45'); }
   return g;
 }
 
@@ -829,40 +830,77 @@ function roundRect(ctx, x, y, w, h, r) {
   ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
 }
 
-/** Two-bone IK: elbow position for a shoulder->hand chain. `bend` picks the elbow side. */
-function ik(sx, sy, tx, ty, L1, L2, bend) {
-  let dx = tx - sx, dy = ty - sy;
+const OUTLINE = '#14181d';
+
+/** Tapered armored limb segment from (x1,y1) to (x2,y2), shaded across its width. */
+function limb(ctx, x1, y1, x2, y2, w1, w2, u, dark, glow) {
+  const dx = x2 - x1, dy = y2 - y1, L = Math.hypot(dx, dy) || 1;
+  const nx = -dy / L, ny = dx / L;
+  ctx.beginPath();
+  ctx.moveTo(x1 + nx * w1 / 2, y1 + ny * w1 / 2); ctx.lineTo(x2 + nx * w2 / 2, y2 + ny * w2 / 2);
+  ctx.lineTo(x2 - nx * w2 / 2, y2 - ny * w2 / 2); ctx.lineTo(x1 - nx * w1 / 2, y1 - ny * w1 / 2);
+  ctx.closePath();
+  const mx = (x1 + x2) / 2, my = (y1 + y2) / 2, w = Math.max(w1, w2) / 2;
+  ctx.fillStyle = metal(ctx, mx + nx * w, my + ny * w, mx - nx * w, my - ny * w, dark);
+  ctx.fill();
+  ctx.strokeStyle = OUTLINE; ctx.lineWidth = Math.max(1, u * 0.05); ctx.stroke();
+  if (glow) {   // glowing seam down the middle of the plate
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.strokeStyle = glow; ctx.globalAlpha = 0.85; ctx.lineWidth = Math.max(1, u * 0.05);
+    ctx.beginPath(); ctx.moveTo(x1 + dx * 0.15, y1 + dy * 0.15); ctx.lineTo(x1 + dx * 0.85, y1 + dy * 0.85); ctx.stroke();
+    ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+  }
+}
+
+function joint(ctx, x, y, r, u, glow) {
+  ctx.fillStyle = metal(ctx, x - r, y - r, x + r, y + r, true);
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = OUTLINE; ctx.lineWidth = Math.max(1, u * 0.05); ctx.stroke();
+  ctx.fillStyle = glow; ctx.beginPath(); ctx.arc(x, y, r * 0.32, 0, Math.PI * 2); ctx.fill();
+}
+
+/** Two-bone IK; picks the elbow that points outward/down for a natural pose. */
+function ik(sx, sy, tx, ty, L1, L2, side) {
+  const dx = tx - sx, dy = ty - sy;
   const d = clamp(Math.hypot(dx, dy), 0.01, L1 + L2 - 0.01);
   const a = Math.atan2(dy, dx);
   const off = Math.acos(clamp((L1 * L1 + d * d - L2 * L2) / (2 * L1 * d), -1, 1));
-  const ex = sx + Math.cos(a + bend * off) * L1, ey = sy + Math.sin(a + bend * off) * L1;
-  return { ex, ey, hx: sx + Math.cos(a) * d, hy: sy + Math.sin(a) * d };
+  let best = null;
+  for (const b of [1, -1]) {
+    const ex = sx + Math.cos(a + b * off) * L1, ey = sy + Math.sin(a + b * off) * L1;
+    const score = side * (ex - sx) + 0.5 * (ey - sy);
+    if (!best || score > best.score) best = { ex, ey, score };
+  }
+  return { ex: best.ex, ey: best.ey, hx: sx + Math.cos(a) * d, hy: sy + Math.sin(a) * d };
 }
 
-/** A robot hand: closed fist (f=1) or open palm with fingers (f=0), pointing along `ang`. */
+/** Robot hand: 4 fingers + thumb, curling into a fist as f -> 1. Points along `ang`. */
 function drawRobotHand(ctx, x, y, ang, u, f, glow) {
   ctx.save();
   ctx.translate(x, y); ctx.rotate(ang);
-  const s = u * 0.62;
-  // fingers (shrink into the fist as f -> 1)
+  const s = u * 0.6;
   ctx.lineCap = 'round';
-  for (let i = -1; i <= 1; i++) {
-    const len = s * (1.1 - f * 0.75);
-    ctx.strokeStyle = metal(ctx, 0, -s, 0, s); ctx.lineWidth = s * 0.34;
-    ctx.beginPath(); ctx.moveTo(s * 0.4, i * s * 0.32); ctx.lineTo(s * 0.4 + len, i * s * 0.32 * (1 + (1 - f) * 0.4)); ctx.stroke();
+  // fingers
+  for (let i = 0; i < 4; i++) {
+    const fy = (i - 1.5) * s * 0.26;
+    const len = s * (1.0 - f * 0.7);
+    ctx.strokeStyle = OUTLINE; ctx.lineWidth = s * 0.26;
+    ctx.beginPath(); ctx.moveTo(s * 0.5, fy); ctx.lineTo(s * 0.5 + len, fy * (1 + (1 - f) * 0.3)); ctx.stroke();
+    ctx.strokeStyle = metal(ctx, 0, -s, 0, s); ctx.lineWidth = s * 0.19;
+    ctx.stroke();
   }
-  // palm / fist block
+  // thumb
+  ctx.strokeStyle = metal(ctx, 0, -s, 0, s); ctx.lineWidth = s * 0.22;
+  ctx.beginPath(); ctx.moveTo(s * 0.1, s * 0.5); ctx.lineTo(s * (0.5 + (1 - f) * 0.2), s * (0.62 + (1 - f) * 0.25)); ctx.stroke();
+  // palm / back of the fist
   ctx.fillStyle = metal(ctx, -s, -s, s, s);
-  roundRect(ctx, -s * 0.5, -s * 0.62, s * 1.2, s * 1.24, s * 0.3); ctx.fill();
-  ctx.strokeStyle = '#1b2026'; ctx.lineWidth = Math.max(1, s * 0.06); ctx.stroke();
-  // finger grooves on the fist
-  ctx.strokeStyle = `rgba(20,24,30,${0.25 + 0.5 * f})`; ctx.lineWidth = Math.max(1, s * 0.05);
-  ctx.beginPath();
-  for (const gy of [-0.17, 0.17]) { ctx.moveTo(s * 0.05, gy * s); ctx.lineTo(s * 0.7, gy * s); }
-  ctx.stroke();
-  // knuckle studs glow
+  roundRect(ctx, -s * 0.45, -s * 0.58, s * 1.05, s * 1.16, s * 0.25); ctx.fill();
+  ctx.strokeStyle = OUTLINE; ctx.lineWidth = Math.max(1, s * 0.06); ctx.stroke();
+  // knuckle guard + glow studs
+  ctx.fillStyle = metal(ctx, 0, -s, 0, s, true);
+  roundRect(ctx, s * 0.42, -s * 0.55, s * 0.22, s * 1.1, s * 0.1); ctx.fill();
   ctx.fillStyle = glow;
-  for (let i = -1; i <= 1; i++) { ctx.beginPath(); ctx.arc(s * 0.55, i * s * 0.34, s * 0.09, 0, Math.PI * 2); ctx.fill(); }
+  for (let i = 0; i < 4; i++) { ctx.beginPath(); ctx.arc(s * 0.53, (i - 1.5) * s * 0.26, s * 0.06, 0, Math.PI * 2); ctx.fill(); }
   ctx.restore();
 }
 
@@ -870,141 +908,184 @@ function drawRobot(ctx) {
   const pal = PALETTES[paletteIdx];
   const glow = pal.glow;
   const fd = robotFacing();
-  const sc = robotScale();
-  const u = robotUnit() * sc;
-  const x = robot.x, y = robot.y;
+  const angry = robot.phase !== 'idle';
+  const eye = angry ? '#ff2a2a' : glow;
+  const u = robotUnit() * robotScale();
+  const ox = robot.x, oy = robotGround() - 5.0 * u + Math.sin(clock * 2) * u * 0.03;   // torso origin, breathing
   const t = clock;
 
   ctx.save();
-  ctx.translate(x, y);
-  ctx.rotate(robot.lean);
+  ctx.translate(ox, oy);
   ctx.lineJoin = 'round';
 
-  // hover thruster flame
-  const fl = u * (1.2 + Math.sin(t * 40) * 0.15 + Math.random() * 0.2);
-  const fg = ctx.createLinearGradient(0, u * 2, 0, u * 2 + fl);
-  fg.addColorStop(0, '#ffffff'); fg.addColorStop(0.3, glow); fg.addColorStop(1, 'rgba(0,0,0,0)');
-  ctx.globalCompositeOperation = 'lighter';
-  ctx.fillStyle = fg;
-  ctx.beginPath(); ctx.moveTo(-u * 0.45, u * 2); ctx.lineTo(u * 0.45, u * 2); ctx.lineTo(0, u * 2 + fl); ctx.closePath(); ctx.fill();
-  ctx.globalCompositeOperation = 'source-over';
+  // ground shadow
+  const sg = ctx.createRadialGradient(0, 5.0 * u, 0, 0, 5.0 * u, 2.2 * u);
+  sg.addColorStop(0, 'rgba(0,0,0,0.55)'); sg.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = sg; ctx.beginPath(); ctx.ellipse(0, 5.0 * u, 2.2 * u, 0.35 * u, 0, 0, Math.PI * 2); ctx.fill();
 
-  // shoulders (back = away from screen center, front = toward it)
-  const backS = { x: -fd * u * 1.35, y: -u * 1.1 }, frontS = { x: fd * u * 1.35, y: -u * 1.1 };
-  const L1 = u * 1.25, L2 = u * 1.15;
+  // ---- legs ----
+  for (const s of [-1, 1]) {
+    const hip = [s * 0.62 * u, 1.75 * u], knee = [s * 0.74 * u, 3.3 * u], ank = [s * 0.78 * u, 4.7 * u];
+    limb(ctx, hip[0], hip[1], knee[0], knee[1], 0.85 * u, 0.62 * u, u, false, glow);
+    limb(ctx, knee[0], knee[1], ank[0], ank[1], 0.7 * u, 0.5 * u, u, true, null);
+    // hydraulic piston on the shin
+    ctx.strokeStyle = '#c7cfd8'; ctx.lineWidth = Math.max(1, u * 0.07);
+    ctx.beginPath(); ctx.moveTo(knee[0] + s * 0.28 * u, knee[1] + 0.2 * u); ctx.lineTo(ank[0] + s * 0.22 * u, ank[1] - 0.25 * u); ctx.stroke();
+    // knee armor
+    ctx.fillStyle = metal(ctx, knee[0] - 0.4 * u, knee[1] - 0.4 * u, knee[0] + 0.4 * u, knee[1] + 0.4 * u);
+    roundRect(ctx, knee[0] - 0.38 * u, knee[1] - 0.3 * u, 0.76 * u, 0.6 * u, 0.2 * u); ctx.fill();
+    ctx.strokeStyle = OUTLINE; ctx.lineWidth = Math.max(1, u * 0.05); ctx.stroke();
+    ctx.fillStyle = glow; ctx.fillRect(knee[0] - 0.2 * u, knee[1] - 0.04 * u, 0.4 * u, 0.08 * u);
+    // foot
+    ctx.fillStyle = metal(ctx, ank[0], 4.6 * u, ank[0], 5.05 * u, true);
+    ctx.beginPath();
+    ctx.moveTo(ank[0] - 0.4 * u, 4.65 * u); ctx.lineTo(ank[0] + 0.4 * u, 4.65 * u);
+    ctx.lineTo(ank[0] + 0.62 * u, 5.0 * u); ctx.lineTo(ank[0] - 0.62 * u, 5.0 * u); ctx.closePath();
+    ctx.fill(); ctx.strokeStyle = OUTLINE; ctx.stroke();
+  }
 
-  // back arm: relaxed, swaying
-  const bt = { x: backS.x - fd * u * 0.4, y: backS.y + u * 2.1 + Math.sin(t * 2) * u * 0.15 };
-  drawArm(ctx, backS, bt, L1, L2, fd, u, robot.phase === 'idle' ? robot.fist * 0.6 : 1, glow, true);
-
-  // pelvis + torso
-  ctx.fillStyle = metal(ctx, -u, u * 1.2, u, u * 2, true);
-  roundRect(ctx, -u * 0.75, u * 1.25, u * 1.5, u * 0.75, u * 0.25); ctx.fill();
-  ctx.fillStyle = metal(ctx, -u * 1.2, -u * 1.5, u * 1.2, u * 1.3);
+  // ---- pelvis + abdomen ----
+  ctx.fillStyle = metal(ctx, -1.2 * u, 1.2 * u, 1.2 * u, 2.0 * u, true);
   ctx.beginPath();
-  ctx.moveTo(-u * 1.25, -u * 1.45); ctx.lineTo(u * 1.25, -u * 1.45);
-  ctx.quadraticCurveTo(u * 1.3, u * 0.4, u * 0.8, u * 1.3); ctx.lineTo(-u * 0.8, u * 1.3);
-  ctx.quadraticCurveTo(-u * 1.3, u * 0.4, -u * 1.25, -u * 1.45); ctx.closePath(); ctx.fill();
-  ctx.strokeStyle = '#1b2026'; ctx.lineWidth = Math.max(1, u * 0.06); ctx.stroke();
-  // panel lines
-  ctx.strokeStyle = 'rgba(20,24,30,0.55)'; ctx.lineWidth = Math.max(1, u * 0.04);
-  ctx.beginPath(); ctx.moveTo(-u * 0.9, u * 0.55); ctx.lineTo(u * 0.9, u * 0.55); ctx.moveTo(0, u * 0.55); ctx.lineTo(0, u * 1.3); ctx.stroke();
-  // chest reactor core (pulses; flares during the punch)
-  const pulse = 0.7 + 0.3 * Math.sin(t * 5) + (robot.phase !== 'idle' ? 0.6 : 0);
-  const cg = ctx.createRadialGradient(0, -u * 0.4, 0, 0, -u * 0.4, u * 0.75 * pulse);
-  cg.addColorStop(0, '#ffffff'); cg.addColorStop(0.35, glow); cg.addColorStop(1, 'rgba(0,0,0,0)');
-  ctx.globalCompositeOperation = 'lighter';
-  ctx.fillStyle = cg; ctx.beginPath(); ctx.arc(0, -u * 0.4, u * 0.75 * pulse, 0, Math.PI * 2); ctx.fill();
-  ctx.globalCompositeOperation = 'source-over';
-  ctx.strokeStyle = '#1b2026'; ctx.lineWidth = Math.max(1, u * 0.08);
-  ctx.beginPath(); ctx.arc(0, -u * 0.4, u * 0.42, 0, Math.PI * 2); ctx.stroke();
-
-  // head: neck, helmet, visor with eyes that look at your hand
-  ctx.fillStyle = metal(ctx, -u * 0.3, -u * 1.9, u * 0.3, -u * 1.4, true);
-  ctx.fillRect(-u * 0.28, -u * 1.85, u * 0.56, u * 0.45);
-  ctx.fillStyle = metal(ctx, -u, -u * 3.2, u, -u * 1.8);
-  roundRect(ctx, -u * 0.85, -u * 3.05, u * 1.7, u * 1.25, u * 0.4); ctx.fill();
-  ctx.strokeStyle = '#1b2026'; ctx.lineWidth = Math.max(1, u * 0.06); ctx.stroke();
-  ctx.fillStyle = '#07090c';
-  roundRect(ctx, -u * 0.68, -u * 2.7, u * 1.36, u * 0.48, u * 0.2); ctx.fill();
-  const lookX = clamp((robot.reach.x - x) / (W * 0.3), -1, 1) * u * 0.18;
-  const lookY = clamp((robot.reach.y - (y - u * 2.4)) / (H * 0.4), -1, 1) * u * 0.06;
-  const eyeR = robot.phase === 'idle' ? u * 0.11 : u * 0.15;
-  ctx.globalCompositeOperation = 'lighter';
-  for (const ex of [-u * 0.3, u * 0.3]) {
-    const eg = ctx.createRadialGradient(ex + lookX, -u * 2.46 + lookY, 0, ex + lookX, -u * 2.46 + lookY, eyeR * 3);
-    eg.addColorStop(0, '#ffffff'); eg.addColorStop(0.3, robot.phase === 'idle' ? glow : '#ff2a2a'); eg.addColorStop(1, 'rgba(0,0,0,0)');
-    ctx.fillStyle = eg; ctx.beginPath(); ctx.arc(ex + lookX, -u * 2.46 + lookY, eyeR * 3, 0, Math.PI * 2); ctx.fill();
+  ctx.moveTo(-1.15 * u, 1.25 * u); ctx.lineTo(1.15 * u, 1.25 * u); ctx.lineTo(0.8 * u, 2.0 * u); ctx.lineTo(-0.8 * u, 2.0 * u); ctx.closePath();
+  ctx.fill(); ctx.strokeStyle = OUTLINE; ctx.lineWidth = Math.max(1, u * 0.05); ctx.stroke();
+  ctx.fillStyle = metal(ctx, 0, 1.3 * u, 0, 2.0 * u);
+  ctx.beginPath(); ctx.moveTo(-0.3 * u, 1.3 * u); ctx.lineTo(0.3 * u, 1.3 * u); ctx.lineTo(0.18 * u, 1.95 * u); ctx.lineTo(-0.18 * u, 1.95 * u); ctx.closePath(); ctx.fill(); ctx.stroke();
+  for (let i = 0; i < 3; i++) {
+    const w = (1.75 - i * 0.12) * u;
+    ctx.fillStyle = metal(ctx, -w / 2, 0, w / 2, 0, true);
+    roundRect(ctx, -w / 2, (0.3 + i * 0.32) * u, w, 0.27 * u, 0.1 * u); ctx.fill(); ctx.stroke();
   }
-  ctx.globalCompositeOperation = 'source-over';
-  // antenna with blinking light
-  ctx.strokeStyle = '#8a95a3'; ctx.lineWidth = Math.max(1, u * 0.07);
-  ctx.beginPath(); ctx.moveTo(u * 0.4, -u * 3.0); ctx.lineTo(u * 0.55, -u * 3.55); ctx.stroke();
-  ctx.fillStyle = Math.floor(t * 3) % 2 ? glow : '#ffffff';
-  ctx.beginPath(); ctx.arc(u * 0.55, -u * 3.6, u * 0.11, 0, Math.PI * 2); ctx.fill();
 
-  // front arm: reaches toward your hand; pulls back on wind-up, thrusts on the punch
-  let ft;
-  if (robot.phase === 'windup') {
-    const k = easeOutCubic(robot.pt / PUNCH_WINDUP);
-    ft = { x: frontS.x - fd * u * 1.0 * k, y: frontS.y + u * 0.4 };
-  } else if (robot.phase === 'punch') {
-    ft = { x: frontS.x + fd * (L1 + L2), y: frontS.y };
-  } else {
-    // local-space direction toward your hand
-    const lx = robot.reach.x - x, ly = robot.reach.y - y;
-    const ang = Math.atan2(ly - frontS.y, lx - frontS.x) - robot.lean;
-    const r = (L1 + L2) * 0.85;
-    ft = { x: frontS.x + Math.cos(ang) * r, y: frontS.y + Math.sin(ang) * r };
+  // ---- chest armor ----
+  ctx.fillStyle = metal(ctx, -1.6 * u, -2.1 * u, 1.2 * u, 0.4 * u);
+  ctx.beginPath();
+  ctx.moveTo(-1.65 * u, -2.05 * u); ctx.lineTo(1.65 * u, -2.05 * u); ctx.lineTo(1.45 * u, -0.6 * u);
+  ctx.lineTo(0.95 * u, 0.35 * u); ctx.lineTo(-0.95 * u, 0.35 * u); ctx.lineTo(-1.45 * u, -0.6 * u); ctx.closePath();
+  ctx.fill(); ctx.stroke();
+  // pec plates
+  ctx.strokeStyle = 'rgba(20,24,30,0.6)';
+  for (const s of [-1, 1]) {
+    ctx.beginPath();
+    ctx.moveTo(s * 0.15 * u, -1.85 * u); ctx.lineTo(s * 1.35 * u, -1.85 * u); ctx.lineTo(s * 1.15 * u, -0.75 * u); ctx.lineTo(s * 0.55 * u, -0.45 * u); ctx.lineTo(s * 0.15 * u, -0.6 * u);
+    ctx.closePath(); ctx.stroke();
   }
-  if (robot.phase !== 'punch') drawArm(ctx, frontS, ft, L1, L2, fd, u, robot.fist, glow, false);
+  // glowing seams under the chest
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.strokeStyle = glow; ctx.lineWidth = Math.max(1, u * 0.06);
+  ctx.beginPath(); ctx.moveTo(-1.35 * u, -0.45 * u); ctx.lineTo(-0.85 * u, 0.25 * u); ctx.lineTo(0.85 * u, 0.25 * u); ctx.lineTo(1.35 * u, -0.45 * u); ctx.stroke();
+  // reactor core
+  const pulse = 0.8 + 0.25 * Math.sin(t * 5) + (angry ? 0.5 : 0);
+  const cg = ctx.createRadialGradient(0, -1.15 * u, 0, 0, -1.15 * u, 0.8 * u * pulse);
+  cg.addColorStop(0, '#ffffff'); cg.addColorStop(0.3, angry ? '#ff5a2a' : glow); cg.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = cg; ctx.beginPath(); ctx.arc(0, -1.15 * u, 0.8 * u * pulse, 0, Math.PI * 2); ctx.fill();
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.strokeStyle = OUTLINE; ctx.lineWidth = Math.max(1, u * 0.08);
+  ctx.beginPath();
+  for (let i = 0; i <= 6; i++) { const a = i / 6 * Math.PI * 2 + Math.PI / 6; const px = Math.cos(a) * 0.42 * u, py = -1.15 * u + Math.sin(a) * 0.42 * u; i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); }
+  ctx.stroke();
+
+  // ---- arms (mirror your arms) ----
+  const L1 = 1.45 * u, L2 = 1.35 * u;
+  const shoulders = { L: [-1.8 * u, -1.75 * u, -1], R: [1.8 * u, -1.75 * u, 1] };
+  const frontKey = fd < 0 ? 'L' : 'R';                       // the arm on the screen-center side throws the punch
+  for (const key of ['L', 'R']) {
+    const [sx, sy, side] = shoulders[key];
+    const A = robot.arms[key];
+    let ax = A.x, ay = A.y, fist = A.fist;
+    if (key === frontKey && robot.phase === 'windup') {      // cock the arm back
+      const k = easeOutCubic(robot.pt / PUNCH_WINDUP);
+      ax = lerp(ax, fd * 0.15, k); ay = lerp(ay, -0.45, k); fist = 1;
+    }
+    if (key === frontKey && (robot.phase === 'punch' || (robot.phase === 'recover' && robot.pt < 0.15))) continue;   // it's the giant fist now
+    const r = (L1 + L2) * 0.98;
+    const { ex, ey, hx, hy } = ik(sx, sy, sx + ax * r, sy + ay * r, L1, L2, side);
+    limb(ctx, sx, sy, ex, ey, 0.62 * u, 0.5 * u, u, false, glow);
+    joint(ctx, ex, ey, 0.3 * u, u, glow);
+    limb(ctx, ex, ey, hx, hy, 0.5 * u, 0.66 * u, u, true, null);      // gauntlet, wider at the wrist
+    drawRobotHand(ctx, hx, hy, Math.atan2(hy - ey, hx - ex), u, fist, glow);
+  }
+  // shoulder pauldrons on top of the arms
+  for (const key of ['L', 'R']) {
+    const [sx, sy, side] = shoulders[key];
+    joint(ctx, sx, sy, 0.38 * u, u, glow);
+    ctx.fillStyle = metal(ctx, sx - 0.7 * u, sy - 0.7 * u, sx + 0.7 * u, sy + 0.4 * u);
+    ctx.beginPath(); ctx.ellipse(sx + side * 0.05 * u, sy - 0.25 * u, 0.72 * u, 0.5 * u, side * 0.35, Math.PI, Math.PI * 2); ctx.closePath();
+    ctx.fill(); ctx.strokeStyle = OUTLINE; ctx.lineWidth = Math.max(1, u * 0.05); ctx.stroke();
+    ctx.strokeStyle = glow; ctx.lineWidth = Math.max(1, u * 0.06);
+    ctx.beginPath(); ctx.ellipse(sx + side * 0.05 * u, sy - 0.25 * u, 0.5 * u, 0.3 * u, side * 0.35, Math.PI * 1.15, Math.PI * 1.85); ctx.stroke();
+  }
+
+  // ---- neck + helmet ----
+  ctx.fillStyle = metal(ctx, -0.35 * u, 0, 0.35 * u, 0, true);
+  ctx.fillRect(-0.32 * u, -2.5 * u, 0.64 * u, 0.5 * u);
+  ctx.strokeStyle = 'rgba(0,0,0,0.6)'; ctx.lineWidth = Math.max(1, u * 0.04);
+  for (let i = 0; i < 3; i++) { ctx.beginPath(); ctx.moveTo(-0.32 * u, (-2.4 + i * 0.14) * u); ctx.lineTo(0.32 * u, (-2.4 + i * 0.14) * u); ctx.stroke(); }
+  // head tilts toward your hand
+  const tilt = clamp((robot.look.x - ox) / W, -0.5, 0.5) * 0.35;
+  ctx.save();
+  ctx.translate(0, -2.45 * u); ctx.rotate(tilt);
+  // ear modules
+  for (const s of [-1, 1]) {
+    ctx.fillStyle = metal(ctx, s * 0.8 * u, -0.9 * u, s * 0.95 * u, -0.3 * u, true);
+    roundRect(ctx, s * 0.92 * u - 0.12 * u, -0.95 * u, 0.24 * u, 0.6 * u, 0.08 * u); ctx.fill();
+    ctx.fillStyle = glow; ctx.fillRect(s * 0.92 * u - 0.04 * u, -0.8 * u, 0.08 * u, 0.3 * u);
+  }
+  // helmet shell
+  ctx.fillStyle = metal(ctx, -0.8 * u, -1.5 * u, 0.8 * u, 0);
+  ctx.beginPath();
+  ctx.moveTo(-0.8 * u, -0.35 * u); ctx.lineTo(-0.85 * u, -1.1 * u); ctx.quadraticCurveTo(0, -1.75 * u, 0.85 * u, -1.1 * u);
+  ctx.lineTo(0.8 * u, -0.35 * u); ctx.lineTo(0.35 * u, 0.05 * u); ctx.lineTo(-0.35 * u, 0.05 * u); ctx.closePath();
+  ctx.fill(); ctx.strokeStyle = OUTLINE; ctx.lineWidth = Math.max(1, u * 0.05); ctx.stroke();
+  // crest fin
+  ctx.fillStyle = metal(ctx, 0, -1.8 * u, 0, -1.2 * u, true);
+  ctx.beginPath(); ctx.moveTo(-0.08 * u, -1.38 * u); ctx.lineTo(0, -1.75 * u); ctx.lineTo(0.08 * u, -1.38 * u); ctx.closePath(); ctx.fill();
+  // T-visor (dark slot) with glowing eye band that tracks your hand
+  ctx.fillStyle = '#05070a';
+  ctx.beginPath();
+  ctx.moveTo(-0.66 * u, -0.95 * u); ctx.lineTo(0.66 * u, -0.95 * u); ctx.lineTo(0.6 * u, -0.7 * u); ctx.lineTo(0.12 * u, -0.7 * u);
+  ctx.lineTo(0.1 * u, -0.25 * u); ctx.lineTo(-0.1 * u, -0.25 * u); ctx.lineTo(-0.12 * u, -0.7 * u); ctx.lineTo(-0.6 * u, -0.7 * u); ctx.closePath();
+  ctx.fill();
+  const lookX = clamp((robot.look.x - ox) / (W * 0.3), -1, 1) * 0.3 * u;
+  ctx.globalCompositeOperation = 'lighter';
+  const vg = ctx.createLinearGradient(-0.62 * u, 0, 0.62 * u, 0);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(clamp(0.5 + lookX / (1.24 * u) - 0.15, 0, 1), eye);
+  vg.addColorStop(clamp(0.5 + lookX / (1.24 * u), 0, 1), '#ffffff');
+  vg.addColorStop(clamp(0.5 + lookX / (1.24 * u) + 0.15, 0, 1), eye);
+  vg.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = vg; ctx.fillRect(-0.62 * u, -0.9 * u, 1.24 * u, 0.15 * u);
+  ctx.globalAlpha = 0.35; ctx.fillStyle = eye; ctx.fillRect(-0.62 * u, -0.98 * u, 1.24 * u, 0.3 * u);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  // mouth grille
+  ctx.strokeStyle = 'rgba(0,0,0,0.65)'; ctx.lineWidth = Math.max(1, u * 0.035);
+  for (const s of [-1, 1]) for (let i = 0; i < 3; i++) {
+    ctx.beginPath(); ctx.moveTo(s * (0.2 + i * 0.12) * u, -0.2 * u); ctx.lineTo(s * (0.2 + i * 0.12) * u, -0.02 * u); ctx.stroke();
+  }
+  ctx.restore();
   ctx.restore();
 
-  // the punch: a giant fist flies out of the robot toward the viewer
+  // ---- the punch: a giant fist flies out of the robot toward the viewer ----
   if (robot.phase === 'punch' || (robot.phase === 'recover' && robot.pt < 0.15)) {
     const p = robot.phase === 'punch' ? robot.pt / PUNCH_HIT : 1;
     const e = p * p;
-    const sx = x + fd * u * 2.5, sy = y - u * 1.1;
-    const fx = lerp(sx, robot.impact.x, e), fy = lerp(sy, robot.impact.y, e);
+    const [lsx, lsy] = shoulders[frontKey];
+    const sx = ox + lsx, sy = oy + lsy;
+    const fx = lerp(sx + fd * u, robot.impact.x, e), fy = lerp(sy, robot.impact.y, e);
     const fu = lerp(u, Math.min(W, H) * 0.35, e);
-    // speed lines
     ctx.save();
     ctx.globalCompositeOperation = 'lighter';
     ctx.strokeStyle = glow; ctx.lineWidth = 2;
-    for (let i = 0; i < 18; i++) {
+    for (let i = 0; i < 18; i++) {   // speed lines
       const a = (i / 18) * Math.PI * 2 + clock * 3;
       const r0 = fu * 1.2, r1 = fu * (1.6 + Math.random() * 1.2);
       ctx.globalAlpha = 0.5 * p;
       ctx.beginPath(); ctx.moveTo(fx + Math.cos(a) * r0, fy + Math.sin(a) * r0); ctx.lineTo(fx + Math.cos(a) * r1, fy + Math.sin(a) * r1); ctx.stroke();
     }
     ctx.restore();
-    // forearm stretching back toward the robot
-    ctx.save();
-    ctx.lineCap = 'round';
-    ctx.strokeStyle = metal(ctx, fx, fy - fu, fx, fy + fu); ctx.lineWidth = fu * 0.7;
-    ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(fx, fy); ctx.stroke();
-    ctx.restore();
-    // fist faces the viewer (knuckles forward)
+    limb(ctx, sx, sy, fx, fy, 0.62 * u, fu * 0.75, u, true, glow);   // arm stretching to the fist
     drawRobotHand(ctx, fx, fy, Math.atan2(fy - sy, fx - sx), fu, 1, glow);
   }
-}
-
-function drawArm(ctx, S, T, L1, L2, fd, u, fist, glow, back) {
-  const bend = back ? fd : -fd;
-  const { ex, ey, hx, hy } = ik(S.x, S.y, T.x, T.y, L1, L2, bend);
-  ctx.lineCap = 'round';
-  ctx.strokeStyle = metal(ctx, S.x, S.y - u * 0.3, S.x, S.y + u * 0.3, back);
-  ctx.lineWidth = u * 0.42;
-  ctx.beginPath(); ctx.moveTo(S.x, S.y); ctx.lineTo(ex, ey); ctx.stroke();
-  ctx.lineWidth = u * 0.36;
-  ctx.beginPath(); ctx.moveTo(ex, ey); ctx.lineTo(hx, hy); ctx.stroke();
-  // joints
-  for (const [jx, jy, r] of [[S.x, S.y, u * 0.38], [ex, ey, u * 0.24]]) {
-    ctx.fillStyle = metal(ctx, jx - r, jy - r, jx + r, jy + r, back);
-    ctx.beginPath(); ctx.arc(jx, jy, r, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = glow; ctx.beginPath(); ctx.arc(jx, jy, r * 0.3, 0, Math.PI * 2); ctx.fill();
-  }
-  drawRobotHand(ctx, hx, hy, Math.atan2(hy - ey, hx - ex), u, fist, glow);
 }
 
 // ---- 7d. SMASHED GLASS: cracks radiating from the punch, then the glass falls away ----
@@ -1641,8 +1722,8 @@ function drawHUD(ctx) {
   hudText(ctx, `PALETTE: ${pal.name}`, L0, H - m - lh * 2, 'left', accent);
   hudText(ctx, `LAST TRIGGER: ${lastTriggerSrc}`, L0, H - m - lh, 'left', '#1fd1a5');
   if (settings.robot) {
-    const ch = controlHand();
-    const rs = robot.phase !== 'idle' ? 'PUNCH!!' : ch ? `HAND CONTROL ${ch.fist ? '[FIST]' : '[OPEN]'}` : 'IDLE - SHOW A HAND';
+    const A = robot.arms, arm = (a) => (a.live ? (a.fist > 0.5 ? 'FIST' : 'OPEN') : '--');
+    const rs = robot.phase !== 'idle' ? 'PUNCH!!' : (A.L.live || A.R.live) ? `MIRRORING  L:${arm(A.L)} R:${arm(A.R)}` : 'IDLE - RAISE YOUR HANDS';
     hudText(ctx, `ROBOT: ${rs}`, L0, H - m - lh * 5, 'left', robot.phase !== 'idle' ? '#ff3b6b' : accent);
   }
 
