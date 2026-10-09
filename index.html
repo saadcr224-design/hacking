@@ -109,7 +109,8 @@
       <h1>HACKER//FACE</h1>
       <p>Live neural face-mesh mask over your webcam. <b>Clap</b> (or slap a hand fast across your face)
          to shatter the mask. Clap again to reassemble it with a new design and palette.
-         Raise a hand: data beams stream from the code panel to your fingertips.</p>
+         Raise a hand: data beams stream from the code panel to your fingertips, and the robot
+         follows your hand (make a fist and it makes a fist). Clap: the robot grows huge and punches the screen.</p>
       <p>Needs <b>camera + microphone</b> access. Nothing leaves your machine.</p>
       <p><kbd>SPACE</kbd> trigger &nbsp; <kbd>F</kbd> fullscreen &nbsp; <kbd>D</kbd> debug &nbsp; <kbd>S</kbd> settings &nbsp; <kbd>M</kbd> next mask</p>
       <button id="startBtn">[ START ]</button>
@@ -134,6 +135,7 @@
       <input type="range" id="codeSpeed" min="0.2" max="3" step="0.1"></label>
     <label class="chk"><input type="checkbox" id="micTrigger"> Clap (microphone) trigger</label>
     <label class="chk"><input type="checkbox" id="slapTrigger"> Hand-slap trigger</label>
+    <label class="chk"><input type="checkbox" id="robot"> Robot (hand control, punches on clap)</label>
     <button id="resetSettings">Reset defaults</button>
   </div>
 

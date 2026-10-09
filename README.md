@@ -1,6 +1,6 @@
 # HACKER//FACE
 
-A webcam effect for the browser. Your camera shows clear and full-screen, with a panel of animated hacker code on one side. Raise a hand and glowing data beams stream from the code panel to your fingertips. A neon face mask tracks your face in one of four designs: Holo Crystal, Circuit, Neon Tribal or Liquid Chrome. **Clap** (or slap a hand fast across your face) and the mask shatters toward the screen. Clap again and it flies back together with a new design and color palette.
+A webcam effect for the browser. Your camera shows clear and full-screen, with a panel of animated hacker code on one side. Raise a hand and glowing data beams stream from the code panel to your fingertips. On the other side stands a robot you control with your hand: it follows your hand around its side of the screen, reaches toward it, and makes a fist when you do. When you clap, the robot winds up, grows huge and throws a giant punch at the screen, which cracks like glass. A neon face mask tracks your face in one of four designs: Holo Crystal, Circuit, Neon Tribal or Liquid Chrome. **Clap** (or slap a hand fast across your face) and the robot punches the screen: the glass cracks and the mask shatters toward you. Clap again and it flies back together with a new design and color palette.
 
 It's plain HTML and JS with no build step. It uses MediaPipe Tasks Vision (Face Landmarker + Hand Landmarker) from a CDN and the Web Audio API for clap detection.
 

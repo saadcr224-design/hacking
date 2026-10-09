@@ -37,6 +37,7 @@ const DEFAULTS = {
   camTint: 0,          // percent of palette color washed over the camera (0 = clear)
   codeWidth: 36,       // code panel width, percent of screen
   codeRight: false,    // code panel on the right instead of the left
+  robot: true,         // hand-controlled robot that punches the screen on a clap
   particleCount: 900,  // shards on shatter (mesh has 852 triangles; more = subdivided)
   codeSpeed: 1,
   micTrigger: true,
@@ -322,6 +323,14 @@ function track(now) {
   if (handLandmarker) processHands(handLandmarker.detectForVideo(video, now), now);
 }
 
+/** A hand is a fist when at least 3 fingertips are curled back toward the wrist. */
+function isFist(p) {
+  const d = (a, b) => Math.hypot(p[a][0] - p[b][0], p[a][1] - p[b][1]);
+  let curled = 0;
+  for (const [tip, knuckle] of [[8, 5], [12, 9], [16, 13], [20, 17]]) if (d(tip, 0) < d(knuckle, 0) * 1.25) curled++;
+  return curled >= 3;
+}
+
 /** Track hands (smoothed, for the beams) and detect the slap gesture: a hand moving fast near the face. */
 function processHands(res, now) {
   for (const h of hands.list) h.seen = false;
@@ -339,7 +348,7 @@ function processHands(res, now) {
       if (d < bd) { bd = d; prev = h; }
     }
     if (!prev || bd > Math.max(W, H) * 0.35) {
-      hands.list.push({ pts: raw, rx: x, ry: y, t: now, speed: 0, alpha: 0, seen: true });
+      hands.list.push({ pts: raw, rx: x, ry: y, t: now, speed: 0, alpha: 0, seen: true, fist: isFist(raw) });
       continue;
     }
     const dt = (now - prev.t) / 1000;
@@ -369,6 +378,7 @@ function processHands(res, now) {
       prev.pts[k][1] += (raw[k][1] - prev.pts[k][1]) * 0.65;
     }
     prev.rx = x; prev.ry = y; prev.t = now; prev.speed = lerp(prev.speed, speed, 0.5); prev.seen = true;
+    prev.fist = isFist(raw);
   }
 }
 
@@ -471,16 +481,20 @@ function trigger(source) {
   const now = performance.now();
   if (now - lastTriggerAt < TRIGGER_COOLDOWN_MS) return;
   if (state === S.REASSEMBLE) return;            // let the mask finish snapping together
+  if (settings.robot && robot.phase !== 'idle') return;   // robot is mid-punch
   lastTriggerAt = now;
   lastTriggerSrc = source;
   console.debug(`[trigger] ${source} in state ${state}`);
   triggerBanner = 1.0;
 
-  if (state === S.MASKED) {
-    startShatter();
-  } else {                                       // UNMASKED, or mid-shatter
-    startReassemble();
-  }
+  const transition = () => {
+    if (state === S.REASSEMBLE) return;
+    if (state === S.MASKED) startShatter();
+    else startReassemble();                      // UNMASKED, or mid-shatter
+  };
+  // With the robot on, the mask breaks / rebuilds when its fist hits the glass.
+  if (settings.robot) robotPunch(transition);
+  else transition();
 }
 
 function updateState(dt) {
@@ -713,6 +727,391 @@ function drawIncoming(ctx) {
       drawTri(ctx, lerp(p.sx, cx, e), lerp(p.sy, cy, e), lerp(p.s0, 1, e), p.rot0 * (1 - e), p.flip0 * (1 - e), lv, col, Math.min(1, prog * 3) * al);
     }
   }
+  ctx.globalAlpha = 1;
+}
+
+// ---- 7c. ROBOT: lives on the side opposite the code panel, driven by your hand.
+//      A clap makes it wind up, grow huge and punch the screen: the glass cracks. ----
+const robot = {
+  x: 0, y: 0, vx: 0, vy: 0,          // body position (spring-follows the target)
+  lean: 0,
+  fist: 0,                           // 0 = open hand, 1 = closed fist (mirrors your hand)
+  reach: { x: 0, y: 0 },             // where the front arm's hand points (screen px)
+  phase: 'idle', pt: 0,              // idle | windup | punch | recover
+  impact: { x: 0, y: 0 },
+  onImpact: null,
+};
+const PUNCH_WINDUP = 0.32, PUNCH_HIT = 0.2, PUNCH_RECOVER = 0.7;
+
+/** Screen region the robot lives in: the far side of the camera area from the code panel. */
+function robotZone() {
+  const zw = Math.max(220, (camR - camL) * 0.34);
+  return settings.codeRight ? { l: camL, r: camL + zw } : { l: camR - zw, r: camR };
+}
+const robotUnit = () => Math.max(16, Math.min(H * 0.07, (robotZone().r - robotZone().l) * 0.13));
+const robotFacing = () => (settings.codeRight ? 1 : -1);    // +1 = robot faces right (toward screen center)
+
+function controlHand() {
+  let best = null;
+  for (const h of hands.list) if (h.seen && (!best || h.alpha > best.alpha)) best = h;
+  return best;
+}
+
+/** Start the punch; `onImpact` runs when the fist hits the glass. Returns false if busy. */
+function robotPunch(onImpact) {
+  if (robot.phase !== 'idle') return false;
+  robot.phase = 'windup'; robot.pt = 0; robot.onImpact = onImpact;
+  // punch lands on your face if we have one, else the middle of the camera area
+  robot.impact.x = face.present ? face.cx : (camL + camR) / 2;
+  robot.impact.y = face.present ? face.cy : H * 0.45;
+  return true;
+}
+
+function updateRobot(dt) {
+  const z = robotZone(), u = robotUnit();
+  const h = controlHand();
+  // target: your hand's position mapped into the robot's zone
+  let tx = (z.l + z.r) / 2, ty = H * 0.55 + Math.sin(clock * 1.6) * u * 0.4;
+  if (h) {
+    tx = z.l + (h.rx / W) * (z.r - z.l);
+    ty = clamp(h.ry, H * 0.3, H - u * 5);
+    robot.fist = lerp(robot.fist, h.fist ? 1 : 0, 1 - Math.pow(0.001, dt));
+    robot.reach.x = h.pts[9][0]; robot.reach.y = h.pts[9][1];
+  } else {
+    robot.fist = lerp(robot.fist, 0, 1 - Math.pow(0.05, dt));
+    robot.reach.x = (camL + camR) / 2; robot.reach.y = H * 0.5 + Math.sin(clock) * 60;
+  }
+  if (robot.phase !== 'idle') {                 // during the punch the robot steps toward the target
+    tx = lerp((z.l + z.r) / 2, robot.impact.x, 0.25); ty = H * 0.55;
+    robot.fist = 1;
+  }
+  // keep the whole robot on screen, even at its biggest wind-up size
+  const half = u * 2.2 * robotScale();
+  tx = clamp(tx, Math.min(z.l + half, W / 2), Math.max(z.r - half, W / 2));
+  ty = clamp(ty, u * 3.8 * robotScale(), H - u * 3.2 * robotScale());
+  if (!robot.x) { robot.x = tx; robot.y = ty; }
+  // critically-damped-ish spring
+  const k = 60, d = 12;
+  robot.vx += ((tx - robot.x) * k - robot.vx * d) * dt;
+  robot.vy += ((ty - robot.y) * k - robot.vy * d) * dt;
+  robot.x += robot.vx * dt; robot.y += robot.vy * dt;
+  robot.lean = lerp(robot.lean, clamp(robot.vx / 900, -0.35, 0.35), 0.2);
+
+  if (robot.phase === 'idle') return;
+  robot.pt += dt;
+  if (robot.phase === 'windup' && robot.pt >= PUNCH_WINDUP) { robot.phase = 'punch'; robot.pt = 0; }
+  else if (robot.phase === 'punch' && robot.pt >= PUNCH_HIT) {
+    robot.phase = 'recover'; robot.pt = 0;
+    smashGlass(robot.impact.x, robot.impact.y);
+    if (robot.onImpact) robot.onImpact();
+    robot.onImpact = null;
+  } else if (robot.phase === 'recover' && robot.pt >= PUNCH_RECOVER) { robot.phase = 'idle'; robot.pt = 0; }
+}
+
+/** Robot body scale: grows during the wind-up, peaks on the hit, shrinks back. */
+function robotScale() {
+  if (robot.phase === 'windup') return 1 + 0.9 * easeOutCubic(robot.pt / PUNCH_WINDUP);
+  if (robot.phase === 'punch') return 1.9 + 0.4 * (robot.pt / PUNCH_HIT);
+  if (robot.phase === 'recover') return lerp(2.3, 1, easeOutCubic(robot.pt / PUNCH_RECOVER));
+  return 1;
+}
+
+function metal(ctx, x0, y0, x1, y1, dark = false) {
+  const g = ctx.createLinearGradient(x0, y0, x1, y1);
+  if (dark) { g.addColorStop(0, '#5b6572'); g.addColorStop(0.5, '#2a3038'); g.addColorStop(1, '#14181d'); }
+  else { g.addColorStop(0, '#f4f8fc'); g.addColorStop(0.45, '#a9b4c2'); g.addColorStop(1, '#3d4550'); }
+  return g;
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+
+/** Two-bone IK: elbow position for a shoulder->hand chain. `bend` picks the elbow side. */
+function ik(sx, sy, tx, ty, L1, L2, bend) {
+  let dx = tx - sx, dy = ty - sy;
+  const d = clamp(Math.hypot(dx, dy), 0.01, L1 + L2 - 0.01);
+  const a = Math.atan2(dy, dx);
+  const off = Math.acos(clamp((L1 * L1 + d * d - L2 * L2) / (2 * L1 * d), -1, 1));
+  const ex = sx + Math.cos(a + bend * off) * L1, ey = sy + Math.sin(a + bend * off) * L1;
+  return { ex, ey, hx: sx + Math.cos(a) * d, hy: sy + Math.sin(a) * d };
+}
+
+/** A robot hand: closed fist (f=1) or open palm with fingers (f=0), pointing along `ang`. */
+function drawRobotHand(ctx, x, y, ang, u, f, glow) {
+  ctx.save();
+  ctx.translate(x, y); ctx.rotate(ang);
+  const s = u * 0.62;
+  // fingers (shrink into the fist as f -> 1)
+  ctx.lineCap = 'round';
+  for (let i = -1; i <= 1; i++) {
+    const len = s * (1.1 - f * 0.75);
+    ctx.strokeStyle = metal(ctx, 0, -s, 0, s); ctx.lineWidth = s * 0.34;
+    ctx.beginPath(); ctx.moveTo(s * 0.4, i * s * 0.32); ctx.lineTo(s * 0.4 + len, i * s * 0.32 * (1 + (1 - f) * 0.4)); ctx.stroke();
+  }
+  // palm / fist block
+  ctx.fillStyle = metal(ctx, -s, -s, s, s);
+  roundRect(ctx, -s * 0.5, -s * 0.62, s * 1.2, s * 1.24, s * 0.3); ctx.fill();
+  ctx.strokeStyle = '#1b2026'; ctx.lineWidth = Math.max(1, s * 0.06); ctx.stroke();
+  // finger grooves on the fist
+  ctx.strokeStyle = `rgba(20,24,30,${0.25 + 0.5 * f})`; ctx.lineWidth = Math.max(1, s * 0.05);
+  ctx.beginPath();
+  for (const gy of [-0.17, 0.17]) { ctx.moveTo(s * 0.05, gy * s); ctx.lineTo(s * 0.7, gy * s); }
+  ctx.stroke();
+  // knuckle studs glow
+  ctx.fillStyle = glow;
+  for (let i = -1; i <= 1; i++) { ctx.beginPath(); ctx.arc(s * 0.55, i * s * 0.34, s * 0.09, 0, Math.PI * 2); ctx.fill(); }
+  ctx.restore();
+}
+
+function drawRobot(ctx) {
+  const pal = PALETTES[paletteIdx];
+  const glow = pal.glow;
+  const fd = robotFacing();
+  const sc = robotScale();
+  const u = robotUnit() * sc;
+  const x = robot.x, y = robot.y;
+  const t = clock;
+
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(robot.lean);
+  ctx.lineJoin = 'round';
+
+  // hover thruster flame
+  const fl = u * (1.2 + Math.sin(t * 40) * 0.15 + Math.random() * 0.2);
+  const fg = ctx.createLinearGradient(0, u * 2, 0, u * 2 + fl);
+  fg.addColorStop(0, '#ffffff'); fg.addColorStop(0.3, glow); fg.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.fillStyle = fg;
+  ctx.beginPath(); ctx.moveTo(-u * 0.45, u * 2); ctx.lineTo(u * 0.45, u * 2); ctx.lineTo(0, u * 2 + fl); ctx.closePath(); ctx.fill();
+  ctx.globalCompositeOperation = 'source-over';
+
+  // shoulders (back = away from screen center, front = toward it)
+  const backS = { x: -fd * u * 1.35, y: -u * 1.1 }, frontS = { x: fd * u * 1.35, y: -u * 1.1 };
+  const L1 = u * 1.25, L2 = u * 1.15;
+
+  // back arm: relaxed, swaying
+  const bt = { x: backS.x - fd * u * 0.4, y: backS.y + u * 2.1 + Math.sin(t * 2) * u * 0.15 };
+  drawArm(ctx, backS, bt, L1, L2, fd, u, robot.phase === 'idle' ? robot.fist * 0.6 : 1, glow, true);
+
+  // pelvis + torso
+  ctx.fillStyle = metal(ctx, -u, u * 1.2, u, u * 2, true);
+  roundRect(ctx, -u * 0.75, u * 1.25, u * 1.5, u * 0.75, u * 0.25); ctx.fill();
+  ctx.fillStyle = metal(ctx, -u * 1.2, -u * 1.5, u * 1.2, u * 1.3);
+  ctx.beginPath();
+  ctx.moveTo(-u * 1.25, -u * 1.45); ctx.lineTo(u * 1.25, -u * 1.45);
+  ctx.quadraticCurveTo(u * 1.3, u * 0.4, u * 0.8, u * 1.3); ctx.lineTo(-u * 0.8, u * 1.3);
+  ctx.quadraticCurveTo(-u * 1.3, u * 0.4, -u * 1.25, -u * 1.45); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = '#1b2026'; ctx.lineWidth = Math.max(1, u * 0.06); ctx.stroke();
+  // panel lines
+  ctx.strokeStyle = 'rgba(20,24,30,0.55)'; ctx.lineWidth = Math.max(1, u * 0.04);
+  ctx.beginPath(); ctx.moveTo(-u * 0.9, u * 0.55); ctx.lineTo(u * 0.9, u * 0.55); ctx.moveTo(0, u * 0.55); ctx.lineTo(0, u * 1.3); ctx.stroke();
+  // chest reactor core (pulses; flares during the punch)
+  const pulse = 0.7 + 0.3 * Math.sin(t * 5) + (robot.phase !== 'idle' ? 0.6 : 0);
+  const cg = ctx.createRadialGradient(0, -u * 0.4, 0, 0, -u * 0.4, u * 0.75 * pulse);
+  cg.addColorStop(0, '#ffffff'); cg.addColorStop(0.35, glow); cg.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.fillStyle = cg; ctx.beginPath(); ctx.arc(0, -u * 0.4, u * 0.75 * pulse, 0, Math.PI * 2); ctx.fill();
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.strokeStyle = '#1b2026'; ctx.lineWidth = Math.max(1, u * 0.08);
+  ctx.beginPath(); ctx.arc(0, -u * 0.4, u * 0.42, 0, Math.PI * 2); ctx.stroke();
+
+  // head: neck, helmet, visor with eyes that look at your hand
+  ctx.fillStyle = metal(ctx, -u * 0.3, -u * 1.9, u * 0.3, -u * 1.4, true);
+  ctx.fillRect(-u * 0.28, -u * 1.85, u * 0.56, u * 0.45);
+  ctx.fillStyle = metal(ctx, -u, -u * 3.2, u, -u * 1.8);
+  roundRect(ctx, -u * 0.85, -u * 3.05, u * 1.7, u * 1.25, u * 0.4); ctx.fill();
+  ctx.strokeStyle = '#1b2026'; ctx.lineWidth = Math.max(1, u * 0.06); ctx.stroke();
+  ctx.fillStyle = '#07090c';
+  roundRect(ctx, -u * 0.68, -u * 2.7, u * 1.36, u * 0.48, u * 0.2); ctx.fill();
+  const lookX = clamp((robot.reach.x - x) / (W * 0.3), -1, 1) * u * 0.18;
+  const lookY = clamp((robot.reach.y - (y - u * 2.4)) / (H * 0.4), -1, 1) * u * 0.06;
+  const eyeR = robot.phase === 'idle' ? u * 0.11 : u * 0.15;
+  ctx.globalCompositeOperation = 'lighter';
+  for (const ex of [-u * 0.3, u * 0.3]) {
+    const eg = ctx.createRadialGradient(ex + lookX, -u * 2.46 + lookY, 0, ex + lookX, -u * 2.46 + lookY, eyeR * 3);
+    eg.addColorStop(0, '#ffffff'); eg.addColorStop(0.3, robot.phase === 'idle' ? glow : '#ff2a2a'); eg.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = eg; ctx.beginPath(); ctx.arc(ex + lookX, -u * 2.46 + lookY, eyeR * 3, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalCompositeOperation = 'source-over';
+  // antenna with blinking light
+  ctx.strokeStyle = '#8a95a3'; ctx.lineWidth = Math.max(1, u * 0.07);
+  ctx.beginPath(); ctx.moveTo(u * 0.4, -u * 3.0); ctx.lineTo(u * 0.55, -u * 3.55); ctx.stroke();
+  ctx.fillStyle = Math.floor(t * 3) % 2 ? glow : '#ffffff';
+  ctx.beginPath(); ctx.arc(u * 0.55, -u * 3.6, u * 0.11, 0, Math.PI * 2); ctx.fill();
+
+  // front arm: reaches toward your hand; pulls back on wind-up, thrusts on the punch
+  let ft;
+  if (robot.phase === 'windup') {
+    const k = easeOutCubic(robot.pt / PUNCH_WINDUP);
+    ft = { x: frontS.x - fd * u * 1.0 * k, y: frontS.y + u * 0.4 };
+  } else if (robot.phase === 'punch') {
+    ft = { x: frontS.x + fd * (L1 + L2), y: frontS.y };
+  } else {
+    // local-space direction toward your hand
+    const lx = robot.reach.x - x, ly = robot.reach.y - y;
+    const ang = Math.atan2(ly - frontS.y, lx - frontS.x) - robot.lean;
+    const r = (L1 + L2) * 0.85;
+    ft = { x: frontS.x + Math.cos(ang) * r, y: frontS.y + Math.sin(ang) * r };
+  }
+  if (robot.phase !== 'punch') drawArm(ctx, frontS, ft, L1, L2, fd, u, robot.fist, glow, false);
+  ctx.restore();
+
+  // the punch: a giant fist flies out of the robot toward the viewer
+  if (robot.phase === 'punch' || (robot.phase === 'recover' && robot.pt < 0.15)) {
+    const p = robot.phase === 'punch' ? robot.pt / PUNCH_HIT : 1;
+    const e = p * p;
+    const sx = x + fd * u * 2.5, sy = y - u * 1.1;
+    const fx = lerp(sx, robot.impact.x, e), fy = lerp(sy, robot.impact.y, e);
+    const fu = lerp(u, Math.min(W, H) * 0.35, e);
+    // speed lines
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.strokeStyle = glow; ctx.lineWidth = 2;
+    for (let i = 0; i < 18; i++) {
+      const a = (i / 18) * Math.PI * 2 + clock * 3;
+      const r0 = fu * 1.2, r1 = fu * (1.6 + Math.random() * 1.2);
+      ctx.globalAlpha = 0.5 * p;
+      ctx.beginPath(); ctx.moveTo(fx + Math.cos(a) * r0, fy + Math.sin(a) * r0); ctx.lineTo(fx + Math.cos(a) * r1, fy + Math.sin(a) * r1); ctx.stroke();
+    }
+    ctx.restore();
+    // forearm stretching back toward the robot
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = metal(ctx, fx, fy - fu, fx, fy + fu); ctx.lineWidth = fu * 0.7;
+    ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(fx, fy); ctx.stroke();
+    ctx.restore();
+    // fist faces the viewer (knuckles forward)
+    drawRobotHand(ctx, fx, fy, Math.atan2(fy - sy, fx - sx), fu, 1, glow);
+  }
+}
+
+function drawArm(ctx, S, T, L1, L2, fd, u, fist, glow, back) {
+  const bend = back ? fd : -fd;
+  const { ex, ey, hx, hy } = ik(S.x, S.y, T.x, T.y, L1, L2, bend);
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = metal(ctx, S.x, S.y - u * 0.3, S.x, S.y + u * 0.3, back);
+  ctx.lineWidth = u * 0.42;
+  ctx.beginPath(); ctx.moveTo(S.x, S.y); ctx.lineTo(ex, ey); ctx.stroke();
+  ctx.lineWidth = u * 0.36;
+  ctx.beginPath(); ctx.moveTo(ex, ey); ctx.lineTo(hx, hy); ctx.stroke();
+  // joints
+  for (const [jx, jy, r] of [[S.x, S.y, u * 0.38], [ex, ey, u * 0.24]]) {
+    ctx.fillStyle = metal(ctx, jx - r, jy - r, jx + r, jy + r, back);
+    ctx.beginPath(); ctx.arc(jx, jy, r, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = glow; ctx.beginPath(); ctx.arc(jx, jy, r * 0.3, 0, Math.PI * 2); ctx.fill();
+  }
+  drawRobotHand(ctx, hx, hy, Math.atan2(hy - ey, hx - ex), u, fist, glow);
+}
+
+// ---- 7d. SMASHED GLASS: cracks radiating from the punch, then the glass falls away ----
+const glass = { cracks: null, x: 0, y: 0, age: 0, shards: [] };
+const GLASS_HOLD = 2.2, GLASS_FADE = 0.6;
+
+function smashGlass(x, y) {
+  shake = 45; glitch = 1;
+  const R = Math.hypot(W, H) * 0.7;
+  const n = 16;
+  const rays = [];
+  for (let i = 0; i < n; i++) {
+    let a = (i / n) * Math.PI * 2 + rand(-0.15, 0.15);
+    const len = rand(0.35, 1) * R;
+    const pts = [[x, y]];
+    let px = x, py = y, dist = 0;
+    while (dist < len) {
+      const step = rand(18, 55) * (1 + dist / R * 2);
+      a += rand(-0.18, 0.18);
+      px += Math.cos(a) * step; py += Math.sin(a) * step; dist += step;
+      pts.push([px, py]);
+    }
+    rays.push(pts);
+  }
+  // concentric rings joining neighbouring rays -> spider-web cracks
+  const rings = [];
+  for (const rr of [45, 110, 210, 340]) {
+    const ring = [];
+    for (const ray of rays) {
+      let best = null, bd = Infinity;
+      for (const p of ray) { const d = Math.abs(Math.hypot(p[0] - x, p[1] - y) - rr * rand(0.85, 1.15)); if (d < bd) { bd = d; best = p; } }
+      ring.push(bd < rr * 0.5 ? best : null);
+    }
+    rings.push(ring);
+  }
+  glass.cracks = { rays, rings };
+  glass.x = x; glass.y = y; glass.age = 0;
+  // little glass splinters bursting from the impact right away
+  for (let i = 0; i < 40; i++) {
+    const a = rand(0, Math.PI * 2), sp = rand(150, 700), s = rand(4, 16);
+    glass.shards.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 200, rot: rand(0, 6), vr: rand(-12, 12), life: 0, max: rand(0.6, 1.2),
+      pts: [[-s, -s * 0.4], [s, -s * 0.2], [rand(-s, s), s]] });
+  }
+}
+
+function dropGlass() {
+  // break the inner web into falling pieces
+  const { rings } = glass.cracks;
+  for (let ri = 0; ri < 2; ri++) {
+    const inner = ri === 0 ? null : rings[ri - 1], outer = rings[ri];
+    for (let i = 0; i < outer.length; i++) {
+      const j = (i + 1) % outer.length;
+      const a = inner ? inner[i] : [glass.x, glass.y], b = outer[i], c = outer[j];
+      if (!a || !b || !c) continue;
+      const cx = (a[0] + b[0] + c[0]) / 3, cy = (a[1] + b[1] + c[1]) / 3;
+      glass.shards.push({ x: cx, y: cy, vx: rand(-60, 60), vy: rand(-80, 20), rot: 0, vr: rand(-3, 3), life: 0, max: 1.6,
+        pts: [[a[0] - cx, a[1] - cy], [b[0] - cx, b[1] - cy], [c[0] - cx, c[1] - cy]] });
+    }
+  }
+}
+
+function drawGlass(ctx, dt) {
+  if (glass.cracks) {
+    const prev = glass.age;
+    glass.age += dt;
+    if (prev < GLASS_HOLD && glass.age >= GLASS_HOLD) dropGlass();
+    const a = glass.age < GLASS_HOLD ? 1 : clamp(1 - (glass.age - GLASS_HOLD) / GLASS_FADE, 0, 1);
+    if (a <= 0) { glass.cracks = null; }
+    else {
+      const { rays, rings } = glass.cracks;
+      const path = new Path2D();
+      for (const ray of rays) { path.moveTo(ray[0][0], ray[0][1]); for (const p of ray) path.lineTo(p[0], p[1]); }
+      for (const ring of rings) {
+        for (let i = 0; i < ring.length; i++) {
+          const p = ring[i], q = ring[(i + 1) % ring.length];
+          if (!p || !q) continue;
+          const mx = (p[0] + q[0]) / 2 + rand(-3, 3), my = (p[1] + q[1]) / 2 + rand(-3, 3);
+          path.moveTo(p[0], p[1]); path.lineTo(mx, my); path.lineTo(q[0], q[1]);
+        }
+      }
+      // impact dent
+      const dg = ctx.createRadialGradient(glass.x, glass.y, 0, glass.x, glass.y, 90);
+      dg.addColorStop(0, `rgba(255,255,255,${0.55 * a})`); dg.addColorStop(0.25, `rgba(180,220,255,${0.25 * a})`); dg.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = dg; ctx.beginPath(); ctx.arc(glass.x, glass.y, 90, 0, Math.PI * 2); ctx.fill();
+      ctx.lineJoin = 'miter'; ctx.lineCap = 'butt';
+      ctx.globalAlpha = 0.6 * a; ctx.strokeStyle = '#000'; ctx.lineWidth = 3; ctx.stroke(path);
+      ctx.globalAlpha = 0.95 * a; ctx.strokeStyle = '#eaf6ff'; ctx.lineWidth = 1.3; ctx.stroke(path);
+      ctx.globalAlpha = 0.35 * a; ctx.strokeStyle = '#9fd8ff'; ctx.lineWidth = 4; ctx.globalCompositeOperation = 'lighter'; ctx.stroke(path);
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.globalAlpha = 1;
+    }
+  }
+  // flying / falling glass pieces
+  let n = 0;
+  for (const s of glass.shards) {
+    s.life += dt;
+    if (s.life >= s.max) continue;
+    s.vy += 1400 * dt; s.x += s.vx * dt; s.y += s.vy * dt; s.rot += s.vr * dt;
+    const c = Math.cos(s.rot), sn = Math.sin(s.rot), al = 1 - s.life / s.max;
+    ctx.beginPath();
+    s.pts.forEach(([px, py], k) => { const X = s.x + px * c - py * sn, Y = s.y + px * sn + py * c; k ? ctx.lineTo(X, Y) : ctx.moveTo(X, Y); });
+    ctx.closePath();
+    ctx.globalAlpha = 0.25 * al; ctx.fillStyle = '#cfeaff'; ctx.fill();
+    ctx.globalAlpha = 0.9 * al; ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1; ctx.stroke();
+    glass.shards[n++] = s;
+  }
+  glass.shards.length = n;
   ctx.globalAlpha = 1;
 }
 
@@ -1241,6 +1640,11 @@ function drawHUD(ctx) {
   hudText(ctx, `MASK: ${MASK_STYLES[styleIdx].name}`, L0, H - m - lh * 3, 'left', accent);
   hudText(ctx, `PALETTE: ${pal.name}`, L0, H - m - lh * 2, 'left', accent);
   hudText(ctx, `LAST TRIGGER: ${lastTriggerSrc}`, L0, H - m - lh, 'left', '#1fd1a5');
+  if (settings.robot) {
+    const ch = controlHand();
+    const rs = robot.phase !== 'idle' ? 'PUNCH!!' : ch ? `HAND CONTROL ${ch.fist ? '[FIST]' : '[OPEN]'}` : 'IDLE - SHOW A HAND';
+    hudText(ctx, `ROBOT: ${rs}`, L0, H - m - lh * 5, 'left', robot.phase !== 'idle' ? '#ff3b6b' : accent);
+  }
 
   const locked = face.present;
   hudText(ctx, locked ? 'FACE LOCKED' : (blink ? 'SCANNING FOR TARGET...' : 'SCANNING FOR TARGET'), R0, H - m - lh * 2, 'right', locked ? '#39ff88' : '#ff3b6b');
@@ -1430,6 +1834,7 @@ function frame(now) {
   updateState(dt);
   updateShards(dt);
   updateReassembly(dt);
+  updateRobot(dt);
   shake *= Math.pow(0.004, dt);
   glitch = Math.max(0, glitch - dt * 2.2);
   triggerBanner = Math.max(0, triggerBanner - dt);
@@ -1458,6 +1863,8 @@ function frame(now) {
   if (shards.length) drawShards(ctx);
   drawHands(ctx, dt);
   applyBloom();
+  if (settings.robot && camReady) drawRobot(ctx);
+  drawGlass(ctx, dt);
 
   if (glitch > 0.01) {
     applyGlitch(cctx, codeCanvas, CW, glitch, null);
@@ -1479,4 +1886,4 @@ resize();
 requestAnimationFrame(frame);
 
 // Handy for console testing: hackerFace.trigger()
-window.hackerFace = { trigger: () => trigger('KEY'), settings, audio, face, hands, audioTick: updateAudio, setStyle: (i) => { styleIdx = i; initPulses(); }, get state() { return state; } };
+window.hackerFace = { trigger: () => trigger('KEY'), settings, audio, face, hands, audioTick: updateAudio, robot, setStyle: (i) => { styleIdx = i; initPulses(); }, get state() { return state; } };
