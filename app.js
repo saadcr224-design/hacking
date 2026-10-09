@@ -333,6 +333,16 @@ function isFist(p) {
   return curled >= 3;
 }
 
+/** Which fingers are raised: [thumb, index, middle, ring, pinky]. */
+function fingersUp(p) {
+  const d = (a, b) => Math.hypot(p[a][0] - p[b][0], p[a][1] - p[b][1]);
+  const ext = [d(4, 17) > d(3, 17) * 1.1 && d(4, 5) > d(2, 5) * 0.9];          // thumb: tip away from the palm
+  for (const [tip, pip] of [[8, 6], [12, 10], [16, 14], [20, 18]]) ext.push(d(tip, 0) > d(pip, 0) * 1.12);
+  return ext;
+}
+/** "One or two fingers" gesture: index up (optionally middle too), ring + pinky down. */
+const isPointer = (h) => h.ext && h.ext[1] && !h.ext[3] && !h.ext[4];
+
 /** Track hands (smoothed, for the beams) and detect the slap gesture: a hand moving fast near the face. */
 function processHands(res, now) {
   for (const h of hands.list) h.seen = false;
@@ -350,7 +360,7 @@ function processHands(res, now) {
       if (d < bd) { bd = d; prev = h; }
     }
     if (!prev || bd > Math.max(W, H) * 0.35) {
-      hands.list.push({ pts: raw, rx: x, ry: y, t: now, speed: 0, alpha: 0, seen: true, fist: isFist(raw) });
+      hands.list.push({ pts: raw, rx: x, ry: y, t: now, speed: 0, alpha: 0, seen: true, fist: isFist(raw), ext: fingersUp(raw), trails: {} });
       continue;
     }
     const dt = (now - prev.t) / 1000;
@@ -382,6 +392,13 @@ function processHands(res, now) {
     prev.vy = lerp(prev.vy || 0, dt > 0.001 && dt < 0.3 ? (y - prev.ry) / dt : 0, 0.5);
     prev.rx = x; prev.ry = y; prev.t = now; prev.speed = lerp(prev.speed, speed, 0.5); prev.seen = true;
     prev.fist = isFist(raw);
+    prev.ext = fingersUp(prev.pts);
+    // glowing air-trail behind each raised fingertip in the 1-2 finger gesture
+    prev.trails = prev.trails || {};
+    if (isPointer(prev)) for (const k of [8, 12]) {
+      if (k === 12 && !prev.ext[2]) continue;
+      (prev.trails[k] = prev.trails[k] || []).push({ x: prev.pts[k][0], y: prev.pts[k][1], t: now });
+    }
   }
 }
 
@@ -753,10 +770,7 @@ const PUNCH_WINDUP = 0.32, PUNCH_HIT = 0.2, PUNCH_RECOVER = 0.7;
 const robotUnit = () => Math.max(14, H * 0.5 / 8.8);          // body is ~8.8 units tall, half the screen
 const robotFacing = () => (settings.codeRight ? 1 : -1);       // +1: robot stands left, faces right
 const robotGround = () => H * 0.985;
-function robotBaseX() {
-  const u = robotUnit();
-  return settings.codeRight ? camL + u * 4.4 : camR - u * 4.4;
-}
+function robotBaseX() { return (camL + camR) / 2; }   // home: centre of the camera area
 
 /**
  * Which of your hands does what. Mirror view: your right hand shows on the right of the screen.
@@ -766,6 +780,9 @@ function robotBaseX() {
  */
 function handRoles() {
   const seen = hands.list.filter((h) => h.seen).sort((a, b) => a.rx - b.rx);
+  // Point with one (or two) fingers: that hand walks the robot; any other hand drives the arm.
+  const pointer = seen.find(isPointer);
+  if (pointer) return { arm: seen.find((h) => h !== pointer) || null, body: null, pointer };
   if (seen.length >= 2) {
     const left = seen[0], right = seen[seen.length - 1];
     return settings.swapHands ? { arm: left, body: right } : { arm: right, body: left };
@@ -784,12 +801,21 @@ function robotPunch(onImpact) {
 
 function updateRobot(dt) {
   const u = robotUnit();
-  const { arm, body } = handRoles();
+  const { arm, body, pointer } = handRoles();
   const minX = camL + u * 2.6, maxX = Math.max(minX, camR - u * 2.6);
   if (!robot.x) robot.x = robotBaseX();
 
   // ---- body hand: walk (left/right), crouch (low), jump (flick up), lean (tilt) ----
   let tx = robot.x, crouchT = 0, leanT = 0;
+  if (!body && !pointer) {                                 // nobody driving: stroll back to the centre
+    robot.idleT = (robot.idleT || 0) + dt;
+    if (robot.idleT > 1.5) tx = robotBaseX();
+  } else robot.idleT = 0;
+  if (pointer && robot.phase === 'idle') {                 // walk toward the side your finger is on
+    tx = pointer.pts[8][0];
+    leanT = clamp((tx - robot.x) / (W * 0.8), -0.2, 0.2);
+    if ((pointer.vy || 0) < -H * 1.6 && robot.jumpY === 0 && robot.jumpV === 0) robot.jumpV = -u * 14;
+  }
   if (body && robot.phase === 'idle') {
     tx = lerp(minX, maxX, clamp((body.rx - camL) / Math.max(1, camR - camL), 0, 1));
     crouchT = clamp((body.ry - H * 0.55) / (H * 0.3), 0, 1);
@@ -830,7 +856,8 @@ function updateRobot(dt) {
   const lh = arm || body;
   robot.look.x = lh ? lh.rx : (face.present ? face.cx : (camL + camR) / 2);
   robot.look.y = lh ? lh.ry : (face.present ? face.cy : H * 0.4);
-  robot.bodyLive = !!body;
+  robot.bodyLive = !!(body || pointer);
+  robot.pointing = !!pointer;
 
   if (robot.phase === 'idle') return;
   robot.pt += dt;
@@ -1642,6 +1669,7 @@ function drawHands(ctx, dt) {
   for (const h of hands.list) {
     const A = h.alpha, energy = clamp(0.6 + h.speed / (W * 0.6), 0.6, 2.2);
     for (let k = 0; k < 5; k++) {
+      if (h.ext && !h.ext[k]) continue;                   // a line only for each raised finger
       const tip = h.pts[TIPS[k]];
       const ox = edgeX, oy = H * (0.16 + 0.17 * k) + hi * 22;
       const dx = Math.abs(tip[0] - ox);
@@ -1669,6 +1697,22 @@ function drawHands(ctx, dt) {
       ctx.beginPath(); ctx.arc(tip[0], tip[1], 7, 0, Math.PI * 2); ctx.fill();
       ctx.globalAlpha = A; ctx.fillStyle = '#fff';
       ctx.beginPath(); ctx.arc(tip[0], tip[1], 2.5, 0, Math.PI * 2); ctx.fill();
+    }
+    // air-trails: the raised fingertip draws a fading neon line as it moves
+    const now = performance.now();
+    for (const k in (h.trails || {})) {
+      const tr = h.trails[k].filter((p) => now - p.t < 700);
+      h.trails[k] = tr;
+      if (tr.length < 2) continue;
+      samplePalette(pal, Number(k) / 20 + clock * 0.2, _c);
+      const col = rgbStr(_c[0], _c[1], _c[2]);
+      for (let i = 1; i < tr.length; i++) {
+        const f = 1 - (now - tr[i].t) / 700;
+        ctx.globalAlpha = A * f * 0.35; ctx.strokeStyle = col; ctx.lineWidth = 12 * f + 2;
+        ctx.beginPath(); ctx.moveTo(tr[i - 1].x, tr[i - 1].y); ctx.lineTo(tr[i].x, tr[i].y); ctx.stroke();
+        ctx.globalAlpha = A * f; ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 3 * f + 1;
+        ctx.stroke();
+      }
     }
     // neon hand skeleton
     ctx.strokeStyle = pal.edge; ctx.globalAlpha = 0.45 * A; ctx.lineWidth = 1.5;
@@ -1773,7 +1817,7 @@ function drawHUD(ctx) {
     const A = robot.arms, arm = (a) => (a.live ? (a.fist > 0.5 ? 'FIST' : 'OPEN') : '--');
     const armA = A.L.live ? A.L : A.R.live ? A.R : null;
     const rs = robot.phase !== 'idle' ? 'PUNCH!!'
-      : `ARM: ${armA ? arm(armA) : '--'}  BODY: ${robot.bodyLive ? (robot.jumpY < 0 ? 'JUMP' : robot.crouch > 0.5 ? 'CROUCH' : Math.abs(robot.vx) > 20 ? 'WALK' : 'READY') : '--'}`;
+      : `ARM: ${armA ? arm(armA) : '--'}  BODY: ${robot.bodyLive ? (robot.jumpY < 0 ? 'JUMP' : robot.crouch > 0.5 ? 'CROUCH' : Math.abs(robot.vx) > 20 ? (robot.pointing ? 'FINGER WALK' : 'WALK') : (robot.pointing ? 'FINGER' : 'READY')) : '--'}`;
     hudText(ctx, `ROBOT: ${rs}`, L0, H - m - lh * 5, 'left', robot.phase !== 'idle' ? '#ff3b6b' : accent);
   }
 
