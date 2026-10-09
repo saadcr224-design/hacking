@@ -2,15 +2,16 @@
  *  HACKER//FACE — live webcam "hacker face" effect
  *
  *  Layers (back -> front):
- *    1. Code background   (#code canvas)  matrix rain + fake typing terminals
- *    2. Ghost face        (#fx canvas)    tinted webcam image at 30% opacity
- *    3. Color mask        (#fx canvas)    468-pt face mesh filled with neon triangles
+ *    1. Camera            (<video>)       crisp mirrored webcam, optional palette tint
+ *    2. Code panel        (#code canvas)  matrix rain + fake typing terminals on one side
+ *    3. Mask + beams      (#fx canvas)    468-pt face mesh mask (4 designs), data beams
+ *                                         from the code panel to your fingertips, bloom
  *    4. HUD               (#fx canvas + CSS scanlines/vignette)
  *
  *  Sections:
  *    0. Settings & constants      6. State machine
  *    1. Palettes & color utils    7. Particle system (shatter / reassemble)
- *    2. Canvas setup              8. Rendering (code bg, ghost, mask)
+ *    2. Canvas setup              8. Rendering (code, mask, hands)
  *    3. Camera                    9. HUD + glitch + debug
  *    4. Face & hand tracking     10. UI: start button, keyboard, settings
  *    5. Audio (clap) trigger     11. Main loop
@@ -30,10 +31,12 @@ const SLAP_SPEED = 4.0;            // hand speed needed for a slap, in face-widt
 const SLAP_RADIUS = 1.4;           // hand must be within this many face-widths of the face center
 const FACE_LOST_MS = 250;          // face considered gone after this long without a detection
 
-const SETTINGS_KEY = 'hackerface.settings.v1';
+const SETTINGS_KEY = 'hackerface.settings.v2';
 const DEFAULTS = {
   sensitivity: 5,      // 1 (deaf) .. 10 (very sensitive)
-  ghostOpacity: 30,    // percent
+  camTint: 0,          // percent of palette color washed over the camera (0 = clear)
+  codeWidth: 36,       // code panel width, percent of screen
+  codeRight: false,    // code panel on the right instead of the left
   particleCount: 900,  // shards on shatter (mesh has 852 triangles; more = subdivided)
   codeSpeed: 1,
   micTrigger: true,
@@ -70,10 +73,10 @@ const PALETTES = [
   { name: 'PURPLE/GOLD',     colors: ['#ffd700', '#ffb300', '#9d4edd', '#7b2cbf', '#e0aaff'], edge: '#fff4cc', tint: '#b26bff' },
   { name: 'RAINBOW',         colors: ['#ff0040', '#ff8c00', '#ffee00', '#00ff6a', '#00b3ff', '#8a2be2'], edge: '#ffffff', tint: '#ff66cc' },
   { name: 'SYNTHWAVE',       colors: ['#f72585', '#b5179e', '#7209b7', '#3a0ca3', '#4cc9f0'], edge: '#ffd6f5', tint: '#f72585' },
-].map((p) => ({ ...p, rgb: p.colors.map(hexToRgb), tintRgb: hexToRgb(p.tint), edgeRgb: hexToRgb(p.edge) }));
+].map((p) => ({ ...p, glow: p.colors[3], rgb: p.colors.map(hexToRgb), tintRgb: hexToRgb(p.tint), edgeRgb: hexToRgb(p.edge) }));
 
 let paletteIdx = 0;                                // State A starts with palette #1
-const ghostTint = [...PALETTES[0].tintRgb];        // eased toward the current palette tint
+const camTintRgb = [...PALETTES[0].tintRgb];       // eased toward the current palette tint
 
 /** Sample a palette as a cyclic gradient at t (any real), write rgb into out. */
 function samplePalette(pal, t, out) {
@@ -102,20 +105,35 @@ function pickNewPalette() {
 const stageEl = document.getElementById('stage');
 const codeCanvas = document.getElementById('code');
 const fxCanvas = document.getElementById('fx');
-const cctx = codeCanvas.getContext('2d', { alpha: false });
+const tintEl = document.getElementById('tint');
+const cctx = codeCanvas.getContext('2d');
 const fctx = fxCanvas.getContext('2d');
 
 let W = 0, H = 0, DPR = 1;
+let CW = 0;               // code panel width (CSS px)
+let edgeX = 0;            // x of the panel's inner edge, where the hand beams start
+let camL = 0, camR = 0;   // the camera area not covered by the panel (HUD lives here)
 
 function resize() {
   DPR = Math.min(window.devicePixelRatio || 1, 1.5);   // cap for performance
   W = window.innerWidth; H = window.innerHeight;
-  for (const [c, ctx] of [[codeCanvas, cctx], [fxCanvas, fctx]]) {
-    c.width = Math.round(W * DPR); c.height = Math.round(H * DPR);
-    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-  }
+
+  // Code panel on one side, fading into the camera at its inner edge.
+  const right = settings.codeRight;
+  CW = Math.round(clamp(W * settings.codeWidth / 100, Math.min(240, W * 0.5), W * 0.7));
+  edgeX = right ? W - CW : CW;
+  camL = right ? 0 : CW; camR = right ? W - CW : W;
+  codeCanvas.style.width = `${CW}px`;
+  codeCanvas.style.left = right ? `${W - CW}px` : '0px';
+  const fade = `linear-gradient(${right ? 'to left' : 'to right'}, #000 82%, transparent 100%)`;
+  codeCanvas.style.maskImage = fade; codeCanvas.style.webkitMaskImage = fade;
+  codeCanvas.width = Math.max(1, Math.round(CW * DPR)); codeCanvas.height = Math.round(H * DPR);
+  cctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+  fxCanvas.width = Math.round(W * DPR); fxCanvas.height = Math.round(H * DPR);
+  fctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   initCodeBackground();
-  initGhost();
+  initBloom();
 }
 window.addEventListener('resize', resize);
 
@@ -130,7 +148,7 @@ let micAvailable = false;
 const view = { dx: 0, dy: 0, dw: 1, dh: 1 };
 
 async function startCamera() {
-  const videoC = { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' };
+  const videoC = { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 }, facingMode: 'user' };  // HD = clear picture
   // Disable browser voice processing: noise suppression / AGC destroy clap transients.
   const audioC = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
   let stream;
@@ -178,11 +196,13 @@ let TRIS = new Uint16Array(0);       // triangle vertex indices (a,b,c)*n
 let EDGES = new Uint16Array(0);      // unique edges for the glowing wireframe
 let NTRI = 0;
 let FEATURE_EDGES = [];              // eyes + lips contours (extra glow)
+let FACE_OVAL = [];                  // face outline (glowing rim)
+let VERT_EDGES = [];                 // vertex -> indices of its edges (energy pulses walk these)
 let HAND_CONNECTIONS = [];
 
-const hands = { list: [], lastSlap: -1e9 };
+const hands = { list: [], lastSlap: -1e9 };   // list: {pts, rx, ry, t, speed, alpha, seen}
+let glyphTrail = [];                           // code glyphs shed by fast hand motion
 let lastVideoTime = -1;
-let trackFrame = 0;
 let trackCount = 0, trackHz = 0;
 
 async function createTask(Cls, fileset, modelAssetPath, extra) {
@@ -236,6 +256,9 @@ function buildMeshTopology(mp) {
     }
   }
   EDGES = Uint16Array.from(edges);
+  VERT_EDGES = Array.from({ length: N_LM }, () => []);
+  for (let e = 0; e < EDGES.length / 2; e++) { VERT_EDGES[EDGES[e * 2]].push(e); VERT_EDGES[EDGES[e * 2 + 1]].push(e); }
+  FACE_OVAL = mp.FaceLandmarker.FACE_LANDMARKS_FACE_OVAL;
   FEATURE_EDGES = [
     ...mp.FaceLandmarker.FACE_LANDMARKS_LEFT_EYE,
     ...mp.FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE,
@@ -246,6 +269,7 @@ function buildMeshTopology(mp) {
   triRGB = new Float32Array(NTRI * 3);
   triVis = new Float32Array(NTRI).fill(1);
   triFlash = new Float32Array(NTRI);
+  initPulses();
 }
 
 /** Fallback: every 3-clique in the edge graph is a triangle. */
@@ -294,37 +318,58 @@ function track(now) {
     face.present = false;
   }
 
-  // Hands every other frame: they are only the backup trigger.
-  if (handLandmarker && (trackFrame++ & 1) === 0) processHands(handLandmarker.detectForVideo(video, now), now);
+  // Hands every frame: they drive the data beams as well as the slap trigger.
+  if (handLandmarker) processHands(handLandmarker.detectForVideo(video, now), now);
 }
 
-/** Slap gesture: a hand moving fast near the face. */
+/** Track hands (smoothed, for the beams) and detect the slap gesture: a hand moving fast near the face. */
 function processHands(res, now) {
-  const out = [];
+  for (const h of hands.list) h.seen = false;
   for (const lms of res.landmarks || []) {
-    const pts = lms.map((l) => [toScreenX(l.x), toScreenY(l.y)]);
+    const raw = lms.map((l) => [toScreenX(l.x), toScreenY(l.y)]);
     let x = 0, y = 0;
-    for (const k of [0, 5, 9, 13, 17]) { x += pts[k][0]; y += pts[k][1]; }   // palm center
+    for (const k of [0, 5, 9, 13, 17]) { x += raw[k][0]; y += raw[k][1]; }   // palm center
     x /= 5; y /= 5;
 
-    // Match with the nearest hand from the previous detection to get velocity.
+    // Match with the nearest hand from the previous detection.
     let prev = null, bd = Infinity;
-    for (const p of hands.list) { const d = Math.hypot(p.x - x, p.y - y); if (d < bd) { bd = d; prev = p; } }
-    let speed = 0;
-    if (prev) { const dt = (now - prev.t) / 1000; if (dt > 0.001 && dt < 0.3) speed = bd / dt; }
-    out.push({ x, y, t: now, speed, pts });
+    for (const h of hands.list) {
+      if (h.seen) continue;
+      const d = Math.hypot(h.rx - x, h.ry - y);
+      if (d < bd) { bd = d; prev = h; }
+    }
+    if (!prev || bd > Math.max(W, H) * 0.35) {
+      hands.list.push({ pts: raw, rx: x, ry: y, t: now, speed: 0, alpha: 0, seen: true });
+      continue;
+    }
+    const dt = (now - prev.t) / 1000;
+    const speed = dt > 0.001 && dt < 0.3 ? bd / dt : 0;
 
     const faceRecent = face.has && now - face.lastSeen < 800;   // a hand over the face can hide it briefly
-    if (settings.slapTrigger && faceRecent && prev && speed > 0) {
+    if (settings.slapTrigger && faceRecent && speed > 0) {
       const fw = face.w, r = fw * SLAP_RADIUS;
-      const near = Math.hypot(x - face.cx, y - face.cy) < r || Math.hypot(prev.x - face.cx, prev.y - face.cy) < r;
+      const near = Math.hypot(x - face.cx, y - face.cy) < r || Math.hypot(prev.rx - face.cx, prev.ry - face.cy) < r;
       if (near && speed > fw * SLAP_SPEED && now - hands.lastSlap > SLAP_COOLDOWN_MS) {
         hands.lastSlap = now;
         trigger('SLAP');
       }
     }
+
+    // Fast motion sheds code glyphs from the fingertips.
+    if (speed > (face.has ? face.w * 1.5 : W * 0.5) && glyphTrail.length < 400) {
+      for (const k of [4, 8, 12, 16, 20]) {
+        glyphTrail.push({ x: raw[k][0], y: raw[k][1], vx: rand(-40, 40), vy: rand(-40, 40), life: 0, max: rand(0.5, 1.1),
+          ch: BEAM_CHARS[(Math.random() * BEAM_CHARS.length) | 0], cyan: Math.random() < 0.4 });
+      }
+    }
+
+    // Light smoothing so the beams don't jitter.
+    for (let k = 0; k < raw.length; k++) {
+      prev.pts[k][0] += (raw[k][0] - prev.pts[k][0]) * 0.65;
+      prev.pts[k][1] += (raw[k][1] - prev.pts[k][1]) * 0.65;
+    }
+    prev.rx = x; prev.ry = y; prev.t = now; prev.speed = lerp(prev.speed, speed, 0.5); prev.seen = true;
   }
-  hands.list = out;
 }
 
 // =====================================================================
@@ -474,7 +519,9 @@ function startShatter() {
   let list = [];
   for (let i = 0; i < NTRI; i++) {
     const a = TRIS[i * 3] * 3, b = TRIS[i * 3 + 1] * 3, c = TRIS[i * 3 + 2] * 3;
-    list.push({ v: [P[a], P[a + 1], P[b], P[b + 1], P[c], P[c + 1]], rgb: [triRGB[i * 3], triRGB[i * 3 + 1], triRGB[i * 3 + 2]] });
+    let rgb = [triRGB[i * 3], triRGB[i * 3 + 1], triRGB[i * 3 + 2]];
+    if (rgb[0] + rgb[1] + rgb[2] < 220) rgb = samplePalette(PALETTES[paletteIdx], triJitter[i], [0, 0, 0]);   // dark designs: bright shards
+    list.push({ v: [P[a], P[a + 1], P[b], P[b + 1], P[c], P[c + 1]], rgb });
   }
   // Match the particle-count setting: drop random triangles, or split the biggest ones.
   const target = Math.round(settings.particleCount);
@@ -594,6 +641,7 @@ const reassembly = { parts: [], t: 0, end: 0, done: true };
 
 function startReassemble() {
   pickNewPalette();
+  pickNewStyle();
   triJitter = triJitter.map(() => Math.random());
   setState(S.REASSEMBLE);
   glitch = 0.6; shake = 8;
@@ -736,21 +784,21 @@ function nextCodeBlock() {
 }
 
 function initCodeBackground() {
-  code.rain.width = Math.round(W * DPR); code.rain.height = Math.round(H * DPR);
+  code.rain.width = Math.max(1, Math.round(CW * DPR)); code.rain.height = Math.max(1, Math.round(H * DPR));
   const r = code.rctx;
   r.setTransform(DPR, 0, 0, DPR, 0, 0);
-  r.fillStyle = '#000'; r.fillRect(0, 0, W, H);
+  r.clearRect(0, 0, CW, H);
   r.font = code.font; r.textBaseline = 'top';
   cctx.font = code.font;
   code.cw = cctx.measureText('M').width || 8.4;
 
-  const nCols = Math.ceil(W / code.fs);
+  const nCols = Math.ceil(CW / code.fs);
   code.cols = Array.from({ length: nCols }, (_, i) => ({
     x: i * code.fs, y: -rand(0, H / code.lh), row: -999, speed: rand(6, 22), cyan: Math.random() < 0.22,
   }));
 
-  const nTerms = clamp(Math.floor(W / 470), 1, 4);
-  const colW = W / nTerms;
+  const nTerms = clamp(Math.floor(CW / 430), 1, 3);
+  const colW = CW / nTerms;
   const rows = Math.max(4, Math.floor((H - 24) / code.lh));
   code.terms = Array.from({ length: nTerms }, (_, i) => {
     const t = { x: i * colW + 14, maxChars: Math.max(10, Math.floor((colW - 28) / code.cw)), rows, lines: [], queue: [], cur: null, wait: rand(0, 1) };
@@ -771,10 +819,11 @@ function renderCode(dt) {
   const sp = settings.codeSpeed;
   const r = code.rctx, lh = code.lh;
 
-  // Matrix rain on its own persistent canvas: fade old glyphs, draw new heads.
-  r.globalAlpha = 1;
+  // Matrix rain on its own transparent canvas: fade old glyphs out, draw new heads.
+  r.globalCompositeOperation = 'destination-out';
   r.fillStyle = `rgba(0,0,0,${1 - Math.pow(0.9, dt * 60)})`;
-  r.fillRect(0, 0, W, H);
+  r.fillRect(0, 0, CW, H);
+  r.globalCompositeOperation = 'source-over';
   for (const c of code.cols) {
     c.y += c.speed * dt * sp;
     const row = Math.floor(c.y);
@@ -782,7 +831,7 @@ function renderCode(dt) {
       for (let k = Math.max(c.row + 1, row - 3); k <= row; k++) {
         if (k < 0) continue;
         if (k > 0) {   // settle previous head into the trail color
-          r.fillStyle = '#000'; r.fillRect(c.x, (k - 1) * lh, code.fs, lh);
+          r.clearRect(c.x, (k - 1) * lh, code.fs, lh);
           r.fillStyle = c.cyan ? '#00c8e0' : '#14d36a';
           r.fillText(RAIN_CHARS[(Math.random() * RAIN_CHARS.length) | 0], c.x, (k - 1) * lh);
         }
@@ -796,17 +845,18 @@ function renderCode(dt) {
     }
   }
 
-  // Compose: black, rain, then typing terminals.
+  // Compose the panel: dark glass, rain, then typing terminals.
   const ctx = cctx;
   ctx.globalAlpha = 1;
-  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
-  ctx.globalAlpha = 0.55;
-  ctx.drawImage(code.rain, 0, 0, W, H);
-  ctx.font = code.font; ctx.textBaseline = 'top';
+  ctx.clearRect(0, 0, CW, H);
+  ctx.fillStyle = 'rgba(0,8,4,0.86)';
+  ctx.fillRect(0, 0, CW, H);
+  ctx.globalAlpha = 0.6;
+  ctx.drawImage(code.rain, 0, 0, CW, H);
+  ctx.font = code.font; ctx.textBaseline = 'top'; ctx.textAlign = 'left';
 
   const blink = Math.floor(clock * 2.5) % 2 === 0;
   for (const t of code.terms) {
-    // typing
     t.wait -= dt * sp;
     if (t.wait <= 0) {
       if (!t.cur) t.cur = nextLine(t);
@@ -819,17 +869,16 @@ function renderCode(dt) {
         t.cur = null; t.wait = L.pause || 0;
       }
     }
-    // draw (older lines dimmer)
     const total = t.lines.length;
     for (let i = 0; i < total; i++) {
       const L = t.lines[i];
       if (!L.text) continue;
-      ctx.globalAlpha = 0.25 + 0.5 * (i / t.rows);
+      ctx.globalAlpha = 0.3 + 0.55 * (i / t.rows);   // older lines dimmer
       ctx.fillStyle = L.color;
       ctx.fillText(L.text, t.x, 12 + i * lh);
     }
     const y = 12 + total * lh;
-    ctx.globalAlpha = 0.9;
+    ctx.globalAlpha = 0.95;
     let curText = '';
     if (t.cur) { curText = t.cur.text.slice(0, Math.floor(t.cur.shown)); ctx.fillStyle = t.cur.color; ctx.fillText(curText, t.x, y); }
     if (blink) { ctx.fillStyle = '#39ff88'; ctx.fillRect(t.x + curText.length * code.cw + 1, y + 1, code.cw * 0.8, lh - 4); }
@@ -837,68 +886,90 @@ function renderCode(dt) {
   ctx.globalAlpha = 1;
 }
 
-// ---- 8b. Ghost face: tinted webcam, composited at settings.ghostOpacity (default 30%) ----
-const ghost = document.createElement('canvas');
-const gctx = ghost.getContext('2d');
-const GHOST_SCALE = 0.5;   // half resolution is plenty for a 30% ghost
-
-function initGhost() {
-  ghost.width = Math.max(1, Math.round(W * GHOST_SCALE));
-  ghost.height = Math.max(1, Math.round(H * GHOST_SCALE));
-}
-
-function drawGhost(ctx, dt) {
-  if (!camReady || video.readyState < 2) return;
-  // ease tint toward the current palette
+// ---- 8b. Camera: shown crisp by the <video> element itself; optional palette tint overlay ----
+let lastTintCss = '';
+function updateCameraTint(dt) {
   const target = PALETTES[paletteIdx].tintRgb, k = 1 - Math.pow(0.02, dt);
-  for (let i = 0; i < 3; i++) ghostTint[i] += (target[i] - ghostTint[i]) * k;
-
-  const gs = GHOST_SCALE;
-  gctx.globalCompositeOperation = 'source-over';
-  gctx.filter = 'grayscale(1) contrast(1.4) brightness(1.2)';
-  gctx.save();
-  gctx.translate(ghost.width, 0); gctx.scale(-1, 1);            // selfie mirror
-  gctx.drawImage(video, view.dx * gs, view.dy * gs, view.dw * gs, view.dh * gs);
-  gctx.restore();
-  gctx.filter = 'none';
-  gctx.globalCompositeOperation = 'multiply';                   // grayscale x tint = tinted
-  gctx.fillStyle = rgbStr(ghostTint[0], ghostTint[1], ghostTint[2]);
-  gctx.fillRect(0, 0, ghost.width, ghost.height);
-  gctx.globalCompositeOperation = 'source-over';
-
-  ctx.globalAlpha = settings.ghostOpacity / 100;
-  ctx.drawImage(ghost, 0, 0, W, H);
-  ctx.globalAlpha = 1;
+  for (let i = 0; i < 3; i++) camTintRgb[i] += (target[i] - camTintRgb[i]) * k;
+  const bg = rgbStr(camTintRgb[0], camTintRgb[1], camTintRgb[2]);
+  const op = String(settings.camTint / 100);
+  if (bg + op !== lastTintCss) { tintEl.style.background = bg; tintEl.style.opacity = op; lastTintCss = bg + op; }
 }
 
-// ---- 8c. Color mask: filled mesh triangles with low-poly shading + glowing edges ----
-const _c = [0, 0, 0];
-const LIGHT = (() => { const l = [-0.35, -0.45, 0.82], n = Math.hypot(...l); return l.map((v) => v / n); })();
+// ---- 8c. Mask: 4 designs, glowing traces, energy pulses, sparkles, bloom ----
+const MASK_STYLES = [
+  { name: 'HOLO CRYSTAL', pulses: 36 },
+  { name: 'CIRCUIT', pulses: 120 },
+  { name: 'NEON TRIBAL', pulses: 24 },
+  { name: 'LIQUID CHROME', pulses: 30 },
+];
+let styleIdx = 0;
+function pickNewStyle() {
+  let i;
+  do { i = Math.floor(Math.random() * MASK_STYLES.length); } while (i === styleIdx);
+  styleIdx = i;
+  initPulses();
+}
 
-/** Compute each triangle's shaded neon color for the given palette into triRGB. */
+const _c = [0, 0, 0];
+
+/** Compute each triangle's color for the current palette + mask style into triRGB. */
 function computeTriColors(pal, time) {
-  const P = face.pts, fw = face.w, fh = face.h;
+  const P = face.pts, fw = face.w, fh = face.h, st = styleIdx;
+  // slowly orbiting light -> moving highlights on holo / chrome
+  const la = time * 0.7;
+  let lx = Math.cos(la) * 0.45, ly = -0.45 + Math.sin(la) * 0.2, lz = 0.8;
+  const ll = Math.hypot(lx, ly, lz); lx /= ll; ly /= ll; lz /= ll;
+  const hl = Math.hypot(lx, ly, lz + 1), hx = lx / hl, hy = ly / hl, hz = (lz + 1) / hl;   // half vector, viewer at +z
+  const band = ((time * 0.45) % 1.8) - 0.4;                                                // holo shimmer sweep
+  const midX = P[168 * 3];                                                                  // between the eyes
+
   for (let i = 0; i < NTRI; i++) {
     const a = TRIS[i * 3] * 3, b = TRIS[i * 3 + 1] * 3, c = TRIS[i * 3 + 2] * 3;
     const mx = (P[a] + P[b] + P[c]) / 3, my = (P[a + 1] + P[b + 1] + P[c + 1]) / 3;
-    // spatial gradient across the face + per-triangle jitter + slow flow over time
-    const t = ((my - face.minY) / fh) * 0.75 + ((mx - face.minX) / fw) * 0.35 + triJitter[i] * 0.18 + time * 0.06;
-    samplePalette(pal, t, _c);
-    // flat shading from the 3D triangle normal
+    const u = (mx - face.minX) / fw, v = (my - face.minY) / fh;
     const ux = P[b] - P[a], uy = P[b + 1] - P[a + 1], uz = P[b + 2] - P[a + 2];
     const vx = P[c] - P[a], vy = P[c + 1] - P[a + 1], vz = P[c + 2] - P[a + 2];
     let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
-    if (nz < 0) { nx = -nx; ny = -ny; nz = -nz; }              // always face the viewer
-    const len = Math.hypot(nx, ny, nz) || 1;
-    const shade = 0.4 + 0.8 * Math.max(0, (nx * LIGHT[0] + ny * LIGHT[1] + nz * LIGHT[2]) / len);
-    triRGB[i * 3] = Math.min(255, _c[0] * shade);
-    triRGB[i * 3 + 1] = Math.min(255, _c[1] * shade);
-    triRGB[i * 3 + 2] = Math.min(255, _c[2] * shade);
+    if (nz < 0) { nx = -nx; ny = -ny; nz = -nz; }
+    const nl = Math.hypot(nx, ny, nz) || 1; nx /= nl; ny /= nl; nz /= nl;
+    const diff = Math.max(0, nx * lx + ny * ly + nz * lz);
+    const spec = Math.pow(Math.max(0, nx * hx + ny * hy + nz * hz), 28);
+    let r, g, bl;
+
+    if (st === 0) {          // HOLO CRYSTAL: iridescent (hue shifts with facing angle) + bright sweep
+      samplePalette(pal, u * 0.35 + v * 0.55 + nx * 0.6 + ny * 0.4 + triJitter[i] * 0.1 + time * 0.12, _c);
+      const k = 0.55 + 0.55 * diff;
+      const d = (u * 0.6 + v * 0.4) - band, sweep = Math.exp(-d * d / 0.005) * 0.55;
+      r = lerp(_c[0] * k, 255, sweep) + 90 * spec; g = lerp(_c[1] * k, 255, sweep) + 90 * spec; bl = lerp(_c[2] * k, 255, sweep) + 90 * spec;
+    } else if (st === 1) {   // CIRCUIT: dark glass plates; the light comes from traces + pulses
+      samplePalette(pal, v * 0.8 + u * 0.2 + time * 0.05, _c);
+      const k = 0.1 + 0.22 * diff + triJitter[i] * 0.07;
+      r = _c[0] * k + 70 * spec; g = _c[1] * k + 70 * spec; bl = _c[2] * k + 70 * spec;
+    } else if (st === 2) {   // NEON TRIBAL: mirror-symmetric animated stripes over a deep base
+      const s = Math.abs(mx - midX) / fw;
+      const p = Math.sin(s * 22 - v * 9 + time * 2.2) + Math.sin(v * 16 + s * 6 - time * 1.3) * 0.6;
+      let k;
+      if (p > 0.55) { samplePalette(pal, 0.5 + v * 0.3 + time * 0.08, _c); k = 0.9 + 0.35 * diff; }
+      else { samplePalette(pal, v * 0.4 + time * 0.05, _c); k = 0.18 + 0.25 * diff; }
+      r = _c[0] * k; g = _c[1] * k; bl = _c[2] * k;
+    } else {                 // LIQUID CHROME: environment reflection by normal + hard specular
+      samplePalette(pal, 0.5 + ny * 0.7 + nx * 0.25 + time * 0.04, _c);
+      const k = 0.25 + 0.75 * diff;
+      r = _c[0] * k * 0.85 + 30 + 255 * spec; g = _c[1] * k * 0.85 + 30 + 255 * spec; bl = _c[2] * k * 0.85 + 30 + 255 * spec;
+    }
+    triRGB[i * 3] = Math.min(255, r); triRGB[i * 3 + 1] = Math.min(255, g); triRGB[i * 3 + 2] = Math.min(255, bl);
   }
 }
 
+function strokeConnections(ctx, conns) {
+  const P = face.pts, path = new Path2D();
+  for (const { start, end } of conns) { path.moveTo(P[start * 3], P[start * 3 + 1]); path.lineTo(P[end * 3], P[end * 3 + 1]); }
+  return path;
+}
+
 function drawMask(ctx, pal, partial) {
-  const P = face.pts;
+  const P = face.pts, st = styleIdx;
   ctx.globalCompositeOperation = 'source-over';
   const edges = new Path2D();
   for (let i = 0; i < NTRI; i++) {
@@ -913,9 +984,7 @@ function drawMask(ctx, pal, partial) {
     ctx.moveTo(P[a], P[a + 1]); ctx.lineTo(P[b], P[b + 1]); ctx.lineTo(P[c], P[c + 1]);
     ctx.closePath();
     ctx.fill();
-    if (partial && vis >= 1) {
-      edges.moveTo(P[a], P[a + 1]); edges.lineTo(P[b], P[b + 1]); edges.lineTo(P[c], P[c + 1]); edges.closePath();
-    }
+    if (partial && vis >= 1) { edges.moveTo(P[a], P[a + 1]); edges.lineTo(P[b], P[b + 1]); edges.lineTo(P[c], P[c + 1]); edges.closePath(); }
   }
   if (!partial) {
     for (let e = 0; e < EDGES.length; e += 2) {
@@ -923,30 +992,199 @@ function drawMask(ctx, pal, partial) {
       edges.moveTo(P[p], P[p + 1]); edges.lineTo(P[q], P[q + 1]);
     }
   }
-  // Glow = wide faint stroke + thin bright stroke, additive.
-  ctx.globalCompositeOperation = 'lighter';
-  ctx.strokeStyle = pal.edge; ctx.lineJoin = 'round';
-  ctx.globalAlpha = 0.18; ctx.lineWidth = 3; ctx.stroke(edges);
-  ctx.globalAlpha = 0.75; ctx.lineWidth = 0.7; ctx.stroke(edges);
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  if (st === 2 || st === 3) {     // solid designs: crisp facet lines
+    ctx.strokeStyle = st === 2 ? 'rgba(0,0,0,0.5)' : 'rgba(255,255,255,0.22)';
+    ctx.globalAlpha = 1; ctx.lineWidth = 0.6; ctx.stroke(edges);
+  } else {                        // glowing wireframe, additive
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.strokeStyle = pal.glow;
+    ctx.globalAlpha = st === 1 ? 0.25 : 0.1; ctx.lineWidth = 3; ctx.stroke(edges);
+    ctx.globalAlpha = st === 1 ? 0.85 : 0.35; ctx.lineWidth = st === 1 ? 0.9 : 0.5; ctx.stroke(edges);
+  }
 
-  // Eyes + lips contours and glowing irises
   if (!partial || reassembly.t > reassembly.end) {
-    const feat = new Path2D();
-    for (const { start, end } of FEATURE_EDGES) {
-      feat.moveTo(P[start * 3], P[start * 3 + 1]); feat.lineTo(P[end * 3], P[end * 3 + 1]);
-    }
-    ctx.globalAlpha = 0.35; ctx.lineWidth = 5; ctx.stroke(feat);
-    ctx.globalAlpha = 1; ctx.lineWidth = 1.4; ctx.strokeStyle = '#ffffff'; ctx.stroke(feat);
+    ctx.globalCompositeOperation = 'lighter';
+    // glowing rim around the face
+    const rim = strokeConnections(ctx, FACE_OVAL);
+    ctx.strokeStyle = pal.glow;
+    ctx.globalAlpha = 0.3; ctx.lineWidth = 8; ctx.stroke(rim);
+    ctx.strokeStyle = pal.edge;
+    ctx.globalAlpha = 0.8; ctx.lineWidth = 1.8; ctx.stroke(rim);
+    // eyes + lips neon outline
+    const feat = strokeConnections(ctx, FEATURE_EDGES);
+    ctx.strokeStyle = pal.glow;
+    ctx.globalAlpha = 0.45; ctx.lineWidth = 6; ctx.stroke(feat);
+    ctx.globalAlpha = 1; ctx.lineWidth = 1.5; ctx.strokeStyle = '#ffffff'; ctx.stroke(feat);
+    // glowing irises
     const ir = face.w * 0.018;
     for (const k of [468, 473]) {
-      ctx.globalAlpha = 0.5; ctx.fillStyle = pal.edge;
-      ctx.beginPath(); ctx.arc(P[k * 3], P[k * 3 + 1], ir * 2.2, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 0.55; ctx.fillStyle = pal.edge;
+      ctx.beginPath(); ctx.arc(P[k * 3], P[k * 3 + 1], ir * 2.4, 0, Math.PI * 2); ctx.fill();
       ctx.globalAlpha = 1; ctx.fillStyle = '#fff';
       ctx.beginPath(); ctx.arc(P[k * 3], P[k * 3 + 1], ir, 0, Math.PI * 2); ctx.fill();
     }
   }
   ctx.globalCompositeOperation = 'source-over';
   ctx.globalAlpha = 1;
+}
+
+// Energy pulses that run along the mesh edges like current through a circuit.
+let pulses = [];
+function initPulses() {
+  if (!EDGES.length) { pulses = []; return; }
+  const ne = EDGES.length / 2;
+  pulses = Array.from({ length: MASK_STYLES[styleIdx].pulses }, () => ({
+    e: (Math.random() * ne) | 0, fwd: Math.random() < 0.5, t: Math.random(), speed: rand(3, 7),
+  }));
+}
+
+function drawPulses(ctx, pal, dt) {
+  if (!pulses.length) return;
+  const P = face.pts;
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = pal.glow; ctx.fillStyle = '#ffffff';
+  for (const p of pulses) {
+    p.t += p.speed * dt;
+    while (p.t >= 1) {   // hop onto a random edge connected to the vertex we reached
+      p.t -= 1;
+      const v = p.fwd ? EDGES[p.e * 2 + 1] : EDGES[p.e * 2];
+      const opts = VERT_EDGES[v];
+      let ne = opts[(Math.random() * opts.length) | 0];
+      if (ne === p.e && opts.length > 1) ne = opts[(opts.indexOf(ne) + 1) % opts.length];
+      p.e = ne; p.fwd = EDGES[ne * 2] === v;
+    }
+    const a = (p.fwd ? EDGES[p.e * 2] : EDGES[p.e * 2 + 1]) * 3, b = (p.fwd ? EDGES[p.e * 2 + 1] : EDGES[p.e * 2]) * 3;
+    const hx = lerp(P[a], P[b], p.t), hy = lerp(P[a + 1], P[b + 1], p.t);
+    const tt = Math.max(0, p.t - 0.7), tx = lerp(P[a], P[b], tt), ty = lerp(P[a + 1], P[b + 1], tt);
+    ctx.globalAlpha = 0.55; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(tx, ty); ctx.lineTo(hx, hy); ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.beginPath(); ctx.arc(hx, hy, 1.8, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+}
+
+// Little star sparkles that drift off the mask.
+let sparkles = [];
+function drawSparkles(ctx, pal, dt, spawn) {
+  if (spawn && NTRI) {
+    for (let k = 0; k < 3; k++) {
+      const vi = TRIS[(Math.random() * TRIS.length) | 0] * 3;
+      const x = face.pts[vi], y = face.pts[vi + 1];
+      sparkles.push({ x, y, vx: (x - face.cx) * 0.5, vy: (y - face.cy) * 0.5 - 20, life: 0, max: rand(0.4, 0.9), size: rand(1.5, 3.5) });
+    }
+  }
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.strokeStyle = pal.edge; ctx.fillStyle = '#fff'; ctx.lineWidth = 1;
+  let n = 0;
+  for (const s of sparkles) {
+    s.life += dt;
+    if (s.life >= s.max) continue;
+    s.x += s.vx * dt; s.y += s.vy * dt;
+    const f = 1 - s.life / s.max, L = s.size * 3 * f;
+    ctx.globalAlpha = f;
+    ctx.beginPath(); ctx.moveTo(s.x - L, s.y); ctx.lineTo(s.x + L, s.y); ctx.moveTo(s.x, s.y - L); ctx.lineTo(s.x, s.y + L); ctx.stroke();
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.size * 0.5 * f + 0.4, 0, Math.PI * 2); ctx.fill();
+    sparkles[n++] = s;
+  }
+  sparkles.length = n;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+}
+
+// ---- 8d. Hands: data beams from the code panel to every fingertip ----
+const TIPS = [4, 8, 12, 16, 20];
+const BEAM_CHARS = '01アイウ{}<>#$%&ABCDEF0x';
+const bez = (p0, p1, p2, p3, t) => { const u = 1 - t; return u * u * u * p0 + 3 * u * u * t * p1 + 3 * u * t * t * p2 + t * t * t * p3; };
+
+function drawHands(ctx, dt) {
+  const pal = PALETTES[paletteIdx];
+  const dir = settings.codeRight ? -1 : 1;           // beams leave the panel toward the camera area
+  for (const h of hands.list) h.alpha = clamp(h.alpha + (h.seen ? 1 : -1) * dt * 5, 0, 1);
+  hands.list = hands.list.filter((h) => h.seen || h.alpha > 0);
+
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = 'bold 13px Consolas, Menlo, "DejaVu Sans Mono", monospace';
+  let hi = 0;
+  for (const h of hands.list) {
+    const A = h.alpha, energy = clamp(0.6 + h.speed / (W * 0.6), 0.6, 2.2);
+    for (let k = 0; k < 5; k++) {
+      const tip = h.pts[TIPS[k]];
+      const ox = edgeX, oy = H * (0.16 + 0.17 * k) + hi * 22;
+      const dx = Math.abs(tip[0] - ox);
+      const c1x = ox + dir * dx * 0.45, c1y = oy, c2x = tip[0] - dir * dx * 0.35, c2y = tip[1];
+      samplePalette(pal, k / 5 + clock * 0.1, _c);
+      const col = rgbStr(_c[0], _c[1], _c[2]);
+      ctx.beginPath(); ctx.moveTo(ox, oy); ctx.bezierCurveTo(c1x, c1y, c2x, c2y, tip[0], tip[1]);
+      ctx.strokeStyle = col;
+      ctx.globalAlpha = 0.14 * A; ctx.lineWidth = 8; ctx.stroke();
+      ctx.globalAlpha = 0.5 * A; ctx.lineWidth = 1.6; ctx.stroke();
+      ctx.setLineDash([4, 16]); ctx.lineDashOffset = -clock * 240 * energy;     // data flowing to the finger
+      ctx.strokeStyle = '#ffffff'; ctx.globalAlpha = 0.85 * A; ctx.lineWidth = 2; ctx.stroke();
+      ctx.setLineDash([]);
+      // code glyphs riding the beam
+      ctx.fillStyle = col;
+      for (let g = 0; g < 4; g++) {
+        const t = (clock * 0.5 * energy + g / 4 + k * 0.17) % 1;
+        ctx.globalAlpha = A * Math.sin(t * Math.PI);
+        ctx.fillText(BEAM_CHARS[(g * 7 + k * 3 + Math.floor(clock * 8)) % BEAM_CHARS.length], bez(ox, c1x, c2x, tip[0], t), bez(oy, c1y, c2y, tip[1], t) - 8);
+      }
+      // port on the panel edge + glowing fingertip
+      ctx.globalAlpha = A; ctx.fillStyle = col;
+      ctx.beginPath(); ctx.arc(ox, oy, 3.5, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 0.6 * A;
+      ctx.beginPath(); ctx.arc(tip[0], tip[1], 7, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = A; ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.arc(tip[0], tip[1], 2.5, 0, Math.PI * 2); ctx.fill();
+    }
+    // neon hand skeleton
+    ctx.strokeStyle = pal.edge; ctx.globalAlpha = 0.45 * A; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (const { start, end } of HAND_CONNECTIONS) { ctx.moveTo(h.pts[start][0], h.pts[start][1]); ctx.lineTo(h.pts[end][0], h.pts[end][1]); }
+    ctx.stroke();
+    hi++;
+  }
+
+  // code glyphs left behind by fast hand motion
+  let n = 0;
+  for (const g of glyphTrail) {
+    g.life += dt;
+    if (g.life >= g.max) continue;
+    g.x += g.vx * dt; g.y += g.vy * dt;
+    ctx.globalAlpha = 1 - g.life / g.max;
+    ctx.fillStyle = g.cyan ? '#5ff6ff' : '#5dff9d';
+    ctx.fillText(g.ch, g.x, g.y);
+    glyphTrail[n++] = g;
+  }
+  glyphTrail.length = n;
+
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+}
+
+// ---- 8e. Bloom: blurred quarter-res copy of mask/beams/shards added back on top ----
+const bloom = document.createElement('canvas');
+const bctx = bloom.getContext('2d');
+function initBloom() {
+  bloom.width = Math.max(1, Math.round(W / 4));
+  bloom.height = Math.max(1, Math.round(H / 4));
+}
+function applyBloom() {
+  bctx.clearRect(0, 0, bloom.width, bloom.height);
+  bctx.filter = 'blur(3px)';
+  bctx.drawImage(fxCanvas, 0, 0, bloom.width, bloom.height);
+  bctx.filter = 'none';
+  fctx.globalCompositeOperation = 'lighter';
+  fctx.globalAlpha = 0.5;
+  fctx.drawImage(bloom, 0, 0, W, H);
+  fctx.globalCompositeOperation = 'source-over';
+  fctx.globalAlpha = 1;
 }
 
 // =====================================================================
@@ -963,46 +1201,52 @@ function hudText(ctx, s, x, y, align = 'left', color = null, size = 12) {
   ctx.fillText(s, x, y);
 }
 
-function drawHUD(ctx, now) {
+function drawHUD(ctx) {
   const pal = PALETTES[paletteIdx];
   const accent = pal.edge;
   const m = 18, lh = 16;
+  const L0 = camL + m, R0 = camR - m, CX = (camL + camR) / 2;   // HUD lives in the camera area
   ctx.globalAlpha = 0.9;
   ctx.shadowColor = '#39ff88'; ctx.shadowBlur = 6;
 
-  // corner brackets
+  // glowing panel edge
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, 'rgba(0,0,0,0)'); grad.addColorStop(0.5, accent); grad.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.strokeStyle = grad; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(edgeX, 0); ctx.lineTo(edgeX, H); ctx.stroke();
+  hudText(ctx, '// DATA UPLINK', settings.codeRight ? edgeX - 8 : edgeX + 8, H / 2 - 30, settings.codeRight ? 'right' : 'left', accent, 11);
+
+  // corner brackets of the camera area
   ctx.strokeStyle = 'rgba(57,255,136,0.6)'; ctx.lineWidth = 1.5;
-  const L = 26;
+  const B = 26, l = camL + 8, r = camR - 8;
   ctx.beginPath();
-  ctx.moveTo(8, 8 + L); ctx.lineTo(8, 8); ctx.lineTo(8 + L, 8);
-  ctx.moveTo(W - 8 - L, 8); ctx.lineTo(W - 8, 8); ctx.lineTo(W - 8, 8 + L);
-  ctx.moveTo(8, H - 8 - L); ctx.lineTo(8, H - 8); ctx.lineTo(8 + L, H - 8);
-  ctx.moveTo(W - 8 - L, H - 8); ctx.lineTo(W - 8, H - 8); ctx.lineTo(W - 8, H - 8 - L);
+  ctx.moveTo(l, 8 + B); ctx.lineTo(l, 8); ctx.lineTo(l + B, 8);
+  ctx.moveTo(r - B, 8); ctx.lineTo(r, 8); ctx.lineTo(r, 8 + B);
+  ctx.moveTo(l, H - 8 - B); ctx.lineTo(l, H - 8); ctx.lineTo(l + B, H - 8);
+  ctx.moveTo(r - B, H - 8); ctx.lineTo(r, H - 8); ctx.lineTo(r, H - 8 - B);
   ctx.stroke();
 
   const blink = Math.floor(clock * 2) % 2 === 0;
   const t = new Date();
-  // top-left
-  hudText(ctx, `> SYSTEM ONLINE${blink ? '_' : ''}`, m, m);
-  hudText(ctx, `> NEURAL MESH v4.7 // ${NTRI || '---'} TRI`, m, m + lh, 'left', '#1fd1a5');
-  hudText(ctx, `> ${t.toTimeString().slice(0, 8)}.${String(t.getMilliseconds()).padStart(3, '0')}`, m, m + lh * 2, 'left', '#1fd1a5');
-  // top-right
-  hudText(ctx, `FPS ${fps.toFixed(0).padStart(3, ' ')}`, W - m, m, 'right', fps >= 30 ? '#39ff88' : '#ffcc00');
-  hudText(ctx, `TRACK ${trackHz.toFixed(0)} Hz`, W - m, m + lh, 'right', '#1fd1a5');
-  const lvl = micAvailable ? clamp((20 * Math.log10(audio.rms + 1e-9) + 60) / 60, 0, 1) : 0;
-  const bars = Math.round(lvl * 10);
-  hudText(ctx, micAvailable ? `MIC [${'|'.repeat(bars).padEnd(10, '.')}]` : 'MIC [OFFLINE]', W - m, m + lh * 2, 'right', '#1fd1a5');
-  // bottom-left
-  hudText(ctx, `STATE: ${state}`, m, H - m - lh * 3, 'left', accent);
-  hudText(ctx, `PALETTE: ${pal.name}`, m, H - m - lh * 2, 'left', accent);
-  hudText(ctx, `LAST TRIGGER: ${lastTriggerSrc}`, m, H - m - lh, 'left', '#1fd1a5');
-  // bottom-right
-  const locked = face.present;
-  hudText(ctx, locked ? 'FACE LOCKED' : (blink ? 'SCANNING FOR TARGET...' : 'SCANNING FOR TARGET'), W - m, H - m - lh * 2, 'right', locked ? '#39ff88' : '#ff3b6b');
-  hudText(ctx, '[SPACE] TRIGGER  [S] SETTINGS  [D] DEBUG  [F] FULL', W - m, H - m - lh, 'right', '#1d8f55', 11);
+  hudText(ctx, `> SYSTEM ONLINE${blink ? '_' : ''}`, L0, m);
+  hudText(ctx, `> NEURAL MESH v5.0 // ${NTRI || '---'} TRI`, L0, m + lh, 'left', '#1fd1a5');
+  hudText(ctx, `> ${t.toTimeString().slice(0, 8)}.${String(t.getMilliseconds()).padStart(3, '0')}`, L0, m + lh * 2, 'left', '#1fd1a5');
 
-  // target brackets around the face
-  if (locked) {
+  hudText(ctx, `FPS ${fps.toFixed(0).padStart(3, ' ')}`, R0, m, 'right', fps >= 30 ? '#39ff88' : '#ffcc00');
+  hudText(ctx, `TRACK ${trackHz.toFixed(0)} Hz  HANDS ${hands.list.filter((h) => h.seen).length}`, R0, m + lh, 'right', '#1fd1a5');
+  const lvl = micAvailable ? clamp((20 * Math.log10(audio.rms + 1e-9) + 60) / 60, 0, 1) : 0;
+  hudText(ctx, micAvailable ? `MIC [${'|'.repeat(Math.round(lvl * 10)).padEnd(10, '.')}]` : 'MIC [OFFLINE]', R0, m + lh * 2, 'right', '#1fd1a5');
+
+  hudText(ctx, `STATE: ${state}`, L0, H - m - lh * 4, 'left', accent);
+  hudText(ctx, `MASK: ${MASK_STYLES[styleIdx].name}`, L0, H - m - lh * 3, 'left', accent);
+  hudText(ctx, `PALETTE: ${pal.name}`, L0, H - m - lh * 2, 'left', accent);
+  hudText(ctx, `LAST TRIGGER: ${lastTriggerSrc}`, L0, H - m - lh, 'left', '#1fd1a5');
+
+  const locked = face.present;
+  hudText(ctx, locked ? 'FACE LOCKED' : (blink ? 'SCANNING FOR TARGET...' : 'SCANNING FOR TARGET'), R0, H - m - lh * 2, 'right', locked ? '#39ff88' : '#ff3b6b');
+  hudText(ctx, '[SPACE] TRIGGER  [M] MASK  [S] SETTINGS  [D] DEBUG  [F] FULL', R0, H - m - lh, 'right', '#1d8f55', 11);
+
+  if (locked) {   // target brackets around the face
     const pad = face.w * 0.18;
     const x0 = face.minX - pad, y0 = face.minY - pad, x1 = face.minX + face.w + pad, y1 = face.minY + face.h + pad;
     const k = Math.min(30, face.w * 0.15);
@@ -1016,64 +1260,55 @@ function drawHUD(ctx, now) {
     hudText(ctx, `TARGET LOCKED // ID ${(face.w * 97 | 0).toString(16).toUpperCase().padStart(4, '0')}`, x0, y0 - 16, 'left', accent, 11);
   }
 
-  // center messages
   const status = modelStatus || (!camReady ? 'AWAITING AUTHORIZATION' : '');
   if (status) {
-    hudText(ctx, status, W / 2, H / 2 - 8, 'center', '#00e5ff', 18);
+    hudText(ctx, status, CX, H / 2 - 8, 'center', '#00e5ff', 18);
   } else if (!locked) {
-    // radar sweep + scanning text
-    const R = Math.min(W, H) * 0.18, a = clock * 3;
+    const R = Math.min(camR - camL, H) * 0.2, a = clock * 3;
     ctx.strokeStyle = 'rgba(57,255,136,0.5)'; ctx.lineWidth = 1.5;
-    ctx.beginPath(); ctx.arc(W / 2, H / 2, R, a, a + 1.2); ctx.stroke();
-    ctx.beginPath(); ctx.arc(W / 2, H / 2, R * 0.7, -a * 1.3, -a * 1.3 + 0.8); ctx.stroke();
-    if (blink) hudText(ctx, 'SCANNING FOR TARGET...', W / 2, H / 2 - 10, 'center', '#ff3b6b', 20);
+    ctx.beginPath(); ctx.arc(CX, H / 2, R, a, a + 1.2); ctx.stroke();
+    ctx.beginPath(); ctx.arc(CX, H / 2, R * 0.7, -a * 1.3, -a * 1.3 + 0.8); ctx.stroke();
+    if (blink) hudText(ctx, 'SCANNING FOR TARGET...', CX, H / 2 - 10, 'center', '#ff3b6b', 20);
   }
 
-  // trigger banner
   if (triggerBanner > 0) {
     ctx.globalAlpha = clamp(triggerBanner * 2, 0, 1);
-    hudText(ctx, `◢ ${lastTriggerSrc} DETECTED ◣`, W / 2, 56, 'center', accent, 22);
+    hudText(ctx, `◢ ${lastTriggerSrc} DETECTED ◣`, CX, 56, 'center', accent, 22);
   }
   ctx.shadowBlur = 0;
   ctx.globalAlpha = 1;
 }
 
-/** Horizontal slice displacement + color flash. Works on any canvas, in place. */
-function applyGlitch(ctx, canvas, g, flashColor) {
+/** Horizontal slice displacement + color flash, in place on a canvas `cw` CSS px wide. */
+function applyGlitch(ctx, canvas, cw, g, flashColor) {
   if (g <= 0.01) return;
   const slices = 3 + Math.floor(g * 10);
   for (let i = 0; i < slices; i++) {
     const y = Math.random() * H, h = rand(3, 40) * (0.4 + g);
-    const dx = rand(-60, 60) * g;
-    ctx.drawImage(canvas, 0, y * DPR, canvas.width, h * DPR, dx, y, W, h);
+    ctx.drawImage(canvas, 0, y * DPR, canvas.width, h * DPR, rand(-60, 60) * g, y, cw, h);
   }
   if (flashColor) {
     ctx.globalCompositeOperation = 'lighter';
     ctx.globalAlpha = Math.pow(g, 2) * 0.55;
     ctx.fillStyle = flashColor;
-    ctx.fillRect(0, 0, W, H);
+    ctx.fillRect(0, 0, cw, H);
     ctx.globalCompositeOperation = 'source-over';
     ctx.globalAlpha = 1;
   }
 }
 
 function drawDebug(ctx) {
-  // landmarks
   if (face.has) {
     ctx.fillStyle = '#ffffff';
     for (let i = 0; i < N_LM; i++) ctx.fillRect(face.pts[i * 3] - 0.75, face.pts[i * 3 + 1] - 0.75, 1.5, 1.5);
   }
   for (const h of hands.list) {
-    ctx.strokeStyle = '#ffcc00'; ctx.lineWidth = 2;
-    ctx.beginPath();
-    for (const { start, end } of HAND_CONNECTIONS) { ctx.moveTo(h.pts[start][0], h.pts[start][1]); ctx.lineTo(h.pts[end][0], h.pts[end][1]); }
-    ctx.stroke();
     const need = face.w * SLAP_SPEED;
-    hudText(ctx, `hand ${h.speed.toFixed(0)} px/s (slap > ${need.toFixed(0)})`, h.x + 12, h.y, 'left', h.speed > need ? '#ff3b6b' : '#ffcc00', 12);
+    hudText(ctx, `hand ${h.speed.toFixed(0)} px/s (slap > ${need.toFixed(0)})`, h.rx + 14, h.ry, 'left', h.speed > need ? '#ff3b6b' : '#ffcc00', 12);
   }
 
   // mic meter (dBFS scale)
-  const w = Math.min(460, W - 32), hgt = 100, x = (W - w) / 2, y = H - hgt - 64;
+  const w = Math.min(460, camR - camL - 32), hgt = 100, x = (camL + camR - w) / 2, y = H - hgt - 80;
   ctx.fillStyle = 'rgba(0,0,0,0.75)'; ctx.fillRect(x, y, w, hgt);
   ctx.strokeStyle = '#1d8f55'; ctx.lineWidth = 1; ctx.strokeRect(x + 0.5, y + 0.5, w - 1, hgt - 1);
   if (!micAvailable) { hudText(ctx, 'MIC UNAVAILABLE', x + w / 2, y + hgt / 2 - 6, 'center', '#ff3b6b'); return; }
@@ -1112,7 +1347,7 @@ startBtn.addEventListener('click', async () => {
   catch (err) { console.warn('Web Audio unavailable:', err); }
 
   if (!navigator.mediaDevices?.getUserMedia) {
-    statusEl.textContent = 'getUserMedia unavailable. Serve over http://localhost (not file://).';
+    statusEl.textContent = 'getUserMedia unavailable. Serve over http://localhost or https (not file://).';
     startBtn.disabled = false; return;
   }
   statusEl.textContent = 'REQUESTING CAMERA + MICROPHONE...';
@@ -1141,11 +1376,14 @@ window.addEventListener('keydown', (e) => {
     case 'f': toggleFullscreen(); break;
     case 'd': debug = !debug; break;
     case 's': settingsEl.classList.toggle('hidden'); break;
+    case 'm': pickNewStyle(); triggerBanner = 0; break;
   }
 });
 
 function bindSettings() {
-  const fmt = { sensitivity: (v) => v, ghostOpacity: (v) => `${v}%`, particleCount: (v) => v, codeSpeed: (v) => `${Number(v).toFixed(1)}x` };
+  const pct = (v) => `${v}%`;
+  const fmt = { sensitivity: (v) => v, camTint: pct, codeWidth: pct, particleCount: (v) => v, codeSpeed: (v) => `${Number(v).toFixed(1)}x` };
+  const LAYOUT_KEYS = ['codeWidth', 'codeRight'];
   const sync = () => {
     for (const k of Object.keys(DEFAULTS)) {
       const el = document.getElementById(k);
@@ -1158,10 +1396,11 @@ function bindSettings() {
     el.addEventListener('input', () => {
       settings[k] = el.type === 'checkbox' ? el.checked : Number(el.value);
       sync(); saveSettings();
+      if (LAYOUT_KEYS.includes(k)) resize();
     });
   }
   document.getElementById('resetSettings').addEventListener('click', (e) => {
-    Object.assign(settings, DEFAULTS); sync(); saveSettings(); e.target.blur();
+    Object.assign(settings, DEFAULTS); sync(); saveSettings(); resize(); e.target.blur();
   });
   sync();
 }
@@ -1177,7 +1416,6 @@ function frame(now) {
   lastT = now;
   clock += dt;
 
-  // FPS / tracking rate
   fpsFrames++;
   if (now - fpsT > 500) {
     fps = (fpsFrames * 1000) / (now - fpsT);
@@ -1185,7 +1423,7 @@ function frame(now) {
     fpsFrames = 0; trackCount = 0; fpsT = now;
   }
 
-  // --- inputs ---
+  // --- inputs (audio runs on its own timer) ---
   if (camReady) { updateView(); try { track(now); } catch (err) { console.error(err); } }
 
   // --- simulation ---
@@ -1198,43 +1436,47 @@ function frame(now) {
   idleGlitchT -= dt;
   if (idleGlitchT <= 0) { idleGlitchT = rand(3, 8); glitch = Math.max(glitch, 0.18); }
 
-  // --- layer 1: code ---
+  // --- layer 1: crisp camera (video element) + optional tint ---
+  updateCameraTint(dt);
+  // --- layer 2: code panel on one side ---
   renderCode(dt);
 
-  // --- layers 2-4 ---
+  // --- layer 3: mask, beams, particles (all bloomed) ---
   const ctx = fctx;
   ctx.clearRect(0, 0, W, H);
-  drawGhost(ctx, dt);
-
   const pal = PALETTES[paletteIdx];
+  const maskOn = face.present && NTRI && state === S.MASKED;
   if (face.present && NTRI && (state === S.MASKED || state === S.REASSEMBLE)) {
     computeTriColors(pal, clock);
     drawMask(ctx, pal, state === S.REASSEMBLE);
   } else if (state === S.REASSEMBLE && face.has && NTRI) {
     computeTriColors(pal, clock);              // face briefly lost: keep flying to last known pose
   }
+  if (maskOn) drawPulses(ctx, pal, dt);
+  drawSparkles(ctx, pal, dt, maskOn);
   if (state === S.REASSEMBLE) drawIncoming(ctx);
   if (shards.length) drawShards(ctx);
+  drawHands(ctx, dt);
+  applyBloom();
 
-  // glitch on both canvases (big flash only on real triggers)
   if (glitch > 0.01) {
-    applyGlitch(cctx, codeCanvas, glitch, null);
-    applyGlitch(ctx, fxCanvas, glitch, glitch > 0.3 ? (glitch > 0.85 ? '#ffffff' : pal.edge) : null);
+    applyGlitch(cctx, codeCanvas, CW, glitch, null);
+    applyGlitch(ctx, fxCanvas, W, glitch, glitch > 0.3 ? (glitch > 0.85 ? '#ffffff' : pal.edge) : null);
   }
 
-  drawHUD(ctx, now);
+  // --- layer 4: HUD ---
+  drawHUD(ctx);
   if (debug) drawDebug(ctx);
 
-  // screen shake (CSS transform on both canvases)
   stageEl.style.transform = shake > 0.3 ? `translate(${rand(-shake, shake).toFixed(1)}px, ${rand(-shake, shake).toFixed(1)}px)` : '';
 
   requestAnimationFrame(frame);
 }
 
-// Boot: the code background runs immediately, even before Start is pressed.
+// Boot: the code panel runs immediately, even before Start is pressed.
 bindSettings();
 resize();
 requestAnimationFrame(frame);
 
 // Handy for console testing: hackerFace.trigger()
-window.hackerFace = { trigger: () => trigger('KEY'), settings, audio, face, audioTick: updateAudio, get state() { return state; } };
+window.hackerFace = { trigger: () => trigger('KEY'), settings, audio, face, hands, audioTick: updateAudio, setStyle: (i) => { styleIdx = i; initPulses(); }, get state() { return state; } };

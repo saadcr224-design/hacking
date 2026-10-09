@@ -1,6 +1,6 @@
 # HACKER//FACE
 
-A webcam effect for the browser. Animated hacker code fills the background, your face shows faintly inside it, and a neon low-poly mask tracks your face. **Clap** (or slap a hand fast across your face) and the mask shatters toward the screen. Clap again and it flies back together in a new color palette.
+A webcam effect for the browser. Your camera shows clear and full-screen, with a panel of animated hacker code on one side. Raise a hand and glowing data beams stream from the code panel to your fingertips. A neon face mask tracks your face in one of four designs: Holo Crystal, Circuit, Neon Tribal or Liquid Chrome. **Clap** (or slap a hand fast across your face) and the mask shatters toward the screen. Clap again and it flies back together with a new design and color palette.
 
 It's plain HTML and JS with no build step. It uses MediaPipe Tasks Vision (Face Landmarker + Hand Landmarker) from a CDN and the Web Audio API for clap detection.
 
@@ -24,7 +24,8 @@ Open the page in Chrome, click **[ START ]**, and allow camera and microphone ac
 | `SPACE` | Trigger (same as a clap) |
 | `F` | Fullscreen |
 | `D` | Debug view: mic level meter, threshold line, face and hand landmarks |
-| `S` | Settings panel: clap sensitivity, ghost opacity, particle count, code speed, toggles for each trigger source |
+| `M` | Next mask design |
+| `S` | Settings panel: clap sensitivity, camera tint (0% = clear), code panel width and side, particle count, code speed, toggles for each trigger source |
 
 Settings are saved in your browser's localStorage.
 
@@ -32,7 +33,7 @@ Settings are saved in your browser's localStorage.
 
 `MASKED` → (trigger) → `SHATTER` → `UNMASKED` → (trigger) → `REASSEMBLE` (new palette) → `MASKED` → …
 
-There are 7 palettes: Cyber pink/blue, Toxic green, Fire, Ice, Purple/gold, Rainbow, Synthwave. The ghost-face tint follows the current palette.
+There are 4 mask designs and 7 palettes (Cyber pink/blue, Toxic green, Fire, Ice, Purple/gold, Rainbow, Synthwave). Each reassemble picks a new design and a new palette.
 
 ## Tuning clap sensitivity
 

@@ -19,10 +19,16 @@
 
   /* ---- Rendering layers ---- */
   #stage { position: fixed; inset: 0; will-change: transform; }
-  #stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  #stage canvas, #stage video, #tint { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  /* Layer 1: the camera itself, shown crisp at native resolution, mirrored like a selfie */
+  #cam { object-fit: cover; transform: scaleX(-1); background: #000; filter: contrast(1.05) saturate(1.12); }
+  #tint { mix-blend-mode: color; opacity: 0; pointer-events: none; }
+  /* Layer 2: code panel, width/side set from JS */
+  #code { right: auto; }
 
   /* Scanlines + vignette are pure CSS (cheap, composited by the GPU) */
   .scanlines {
+    opacity: 0.55;
     position: fixed; inset: 0; pointer-events: none; z-index: 5;
     background: repeating-linear-gradient(to bottom,
       rgba(0,0,0,0) 0px, rgba(0,0,0,0) 2px, rgba(0,0,0,0.22) 3px, rgba(0,0,0,0) 4px);
@@ -37,11 +43,9 @@
   @keyframes sweep { to { transform: translateY(140vh); } }
   .vignette {
     position: fixed; inset: 0; pointer-events: none; z-index: 6;
-    background: radial-gradient(ellipse at center, rgba(0,0,0,0) 55%, rgba(0,0,0,0.75) 100%);
+    background: radial-gradient(ellipse at center, rgba(0,0,0,0) 65%, rgba(0,0,0,0.55) 100%);
   }
 
-  /* Hidden webcam element: kept in the DOM and "visible" so Chrome keeps decoding frames */
-  #cam { position: absolute; width: 2px; height: 2px; opacity: 0; pointer-events: none; left: 0; top: 0; }
 
   /* ---- Start overlay ---- */
   #start {
@@ -92,20 +96,22 @@
 </head>
 <body>
   <div id="stage">
-    <canvas id="code"></canvas>  <!-- layer 1: animated code background -->
-    <canvas id="fx"></canvas>    <!-- layers 2-4: ghost face, color mask/particles, HUD -->
+    <video id="cam" playsinline muted autoplay></video>  <!-- layer 1: crisp camera -->
+    <div id="tint"></div>                                <!-- optional palette tint over the camera -->
+    <canvas id="code"></canvas>                          <!-- layer 2: code panel on one side -->
+    <canvas id="fx"></canvas>                            <!-- layers 3-4: mask, hand beams, particles, HUD -->
   </div>
   <div class="scanlines"></div>
   <div class="vignette"></div>
-  <video id="cam" playsinline muted autoplay></video>
 
   <div id="start">
     <div class="box">
       <h1>HACKER//FACE</h1>
       <p>Live neural face-mesh mask over your webcam. <b>Clap</b> (or slap a hand fast across your face)
-         to shatter the mask. Clap again to reassemble it with a new palette.</p>
+         to shatter the mask. Clap again to reassemble it with a new design and palette.
+         Raise a hand: data beams stream from the code panel to your fingertips.</p>
       <p>Needs <b>camera + microphone</b> access. Nothing leaves your machine.</p>
-      <p><kbd>SPACE</kbd> trigger &nbsp; <kbd>F</kbd> fullscreen &nbsp; <kbd>D</kbd> debug &nbsp; <kbd>S</kbd> settings</p>
+      <p><kbd>SPACE</kbd> trigger &nbsp; <kbd>F</kbd> fullscreen &nbsp; <kbd>D</kbd> debug &nbsp; <kbd>S</kbd> settings &nbsp; <kbd>M</kbd> next mask</p>
       <button id="startBtn">[ START ]</button>
       <div id="status"></div>
     </div>
@@ -116,8 +122,12 @@
     <label>Clap sensitivity <span id="v-sensitivity"></span>
       <input type="range" id="sensitivity" min="1" max="10" step="0.5"></label>
     <div class="hint">Higher = triggers on quieter claps. Lower it if speech/noise triggers it. Use <b>D</b> to see the meter.</div>
-    <label>Ghost face opacity <span id="v-ghostOpacity"></span>
-      <input type="range" id="ghostOpacity" min="0" max="100" step="1"></label>
+    <label>Camera color tint <span id="v-camTint"></span>
+      <input type="range" id="camTint" min="0" max="80" step="1"></label>
+    <div class="hint">0% = clear, natural camera. Higher washes the camera in the palette color.</div>
+    <label>Code panel width <span id="v-codeWidth"></span>
+      <input type="range" id="codeWidth" min="20" max="60" step="1"></label>
+    <label class="chk"><input type="checkbox" id="codeRight"> Code panel on the right side</label>
     <label>Particle count <span id="v-particleCount"></span>
       <input type="range" id="particleCount" min="100" max="1700" step="50"></label>
     <label>Code speed <span id="v-codeSpeed"></span>
