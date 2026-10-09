@@ -228,7 +228,7 @@ async function loadModels() {
     modelStatus = '';
     try {
       handLandmarker = await createTask(MP.HandLandmarker, fileset, HAND_MODEL, {
-        numHands: 2, minHandDetectionConfidence: 0.5, minHandPresenceConfidence: 0.5, minTrackingConfidence: 0.5,
+        numHands: 2, minHandDetectionConfidence: 0.3, minHandPresenceConfidence: 0.3, minTrackingConfidence: 0.3,   // low = keeps hands/fingers locked
       });
     } catch (err) { console.warn('Hand landmarker unavailable (slap trigger disabled):', err); }
   } catch (err) {
@@ -335,19 +335,42 @@ function isFist(p) {
 
 /** Which fingers are raised: [thumb, index, middle, ring, pinky]. */
 function fingersUp(p) {
-  const d = (a, b) => Math.hypot(p[a][0] - p[b][0], p[a][1] - p[b][1]);
-  const ext = [d(4, 17) > d(3, 17) * 1.1 && d(4, 5) > d(2, 5) * 0.9];          // thumb: tip away from the palm
-  for (const [tip, pip] of [[8, 6], [12, 10], [16, 14], [20, 18]]) ext.push(d(tip, 0) > d(pip, 0) * 1.12);
+  // p: 3D landmarks. A finger is "up" when its joints are nearly in a straight line (works even
+  // when it points at the camera) and its tip is farther from the wrist than its middle joint.
+  const sub = (a, b) => [p[a][0] - p[b][0], p[a][1] - p[b][1], p[a][2] - p[b][2]];
+  const len = (v) => Math.hypot(v[0], v[1], v[2]) || 1;
+  const cos = (v, w) => (v[0] * w[0] + v[1] * w[1] + v[2] * w[2]) / (len(v) * len(w));
+  const dist = (a, b) => len(sub(a, b));
+  const ext = [cos(sub(3, 2), sub(4, 3)) > 0.7 && dist(4, 9) > dist(3, 9)];      // thumb: straight, tip moving away from the palm
+  for (const [m, pp, d, t] of [[5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16], [17, 18, 19, 20]]) {
+    const straight = cos(sub(pp, m), sub(d, pp)) > 0.5 && cos(sub(d, pp), sub(t, d)) > 0.5;
+    ext.push(straight && dist(t, 0) > dist(pp, 0));
+  }
   return ext;
 }
-/** "One or two fingers" gesture: index up (optionally middle too), ring + pinky down. */
-const isPointer = (h) => h.ext && h.ext[1] && !h.ext[3] && !h.ext[4];
+
+/** Smooth finger states over frames with hysteresis so they don't flicker. */
+function updateFingers(h, p3, now) {
+  const raw = fingersUp(p3);
+  h.extS = h.extS || raw.map((e) => (e ? 1 : 0));
+  h.ext = h.ext || raw.slice();
+  for (let i = 0; i < 5; i++) {
+    h.extS[i] += ((raw[i] ? 1 : 0) - h.extS[i]) * 0.5;
+    h.ext[i] = h.extS[i] > (h.ext[i] ? 0.3 : 0.6);
+  }
+  if (h.ext[1] && !h.ext[3] && !h.ext[4]) h.pointerT = now;
+}
+
+/** "One or two fingers" gesture: index up (optionally middle too), ring + pinky down.
+ *  Held for 300 ms through brief tracking dropouts. */
+const isPointer = (h) => h.pointerT !== undefined && performance.now() - h.pointerT < 300;
 
 /** Track hands (smoothed, for the beams) and detect the slap gesture: a hand moving fast near the face. */
 function processHands(res, now) {
   for (const h of hands.list) h.seen = false;
   for (const lms of res.landmarks || []) {
     const raw = lms.map((l) => [toScreenX(l.x), toScreenY(l.y)]);
+    const p3 = lms.map((l) => [l.x * view.dw, l.y * view.dh, l.z * view.dw]);       // 3D, for finger angles
     let x = 0, y = 0;
     for (const k of [0, 5, 9, 13, 17]) { x += raw[k][0]; y += raw[k][1]; }   // palm center
     x /= 5; y /= 5;
@@ -360,7 +383,9 @@ function processHands(res, now) {
       if (d < bd) { bd = d; prev = h; }
     }
     if (!prev || bd > Math.max(W, H) * 0.35) {
-      hands.list.push({ pts: raw, rx: x, ry: y, t: now, speed: 0, alpha: 0, seen: true, fist: isFist(raw), ext: fingersUp(raw), trails: {} });
+      const nh = { pts: raw, rx: x, ry: y, t: now, speed: 0, alpha: 0, seen: true, fist: isFist(raw), trails: {} };
+      updateFingers(nh, p3, now);
+      hands.list.push(nh);
       continue;
     }
     const dt = (now - prev.t) / 1000;
@@ -392,7 +417,10 @@ function processHands(res, now) {
     prev.vy = lerp(prev.vy || 0, dt > 0.001 && dt < 0.3 ? (y - prev.ry) / dt : 0, 0.5);
     prev.rx = x; prev.ry = y; prev.t = now; prev.speed = lerp(prev.speed, speed, 0.5); prev.seen = true;
     prev.fist = isFist(raw);
-    prev.ext = fingersUp(prev.pts);
+    updateFingers(prev, p3, now);
+    // fingertip horizontal speed (for the swipe that sends the robot to a side)
+    const tvx = dt > 0.001 && dt < 0.3 ? (raw[8][0] - (prev.tipX ?? raw[8][0])) / dt : 0;
+    prev.tipVx = lerp(prev.tipVx || 0, tvx, 0.5); prev.tipX = raw[8][0];
     // glowing air-trail behind each raised fingertip in the 1-2 finger gesture
     prev.trails = prev.trails || {};
     if (isPointer(prev)) for (const k of [8, 12]) {
@@ -807,17 +835,20 @@ function updateRobot(dt) {
 
   // ---- body hand: walk (left/right), crouch (low), jump (flick up), lean (tilt) ----
   let tx = robot.x, crouchT = 0, leanT = 0;
-  if (!body && !pointer) {                                 // nobody driving: stroll back to the centre
-    robot.idleT = (robot.idleT || 0) + dt;
-    if (robot.idleT > 1.5) tx = robotBaseX();
-  } else robot.idleT = 0;
-  if (pointer && robot.phase === 'idle') {                 // walk toward the side your finger is on
-    tx = pointer.pts[8][0];
-    leanT = clamp((tx - robot.x) / (W * 0.8), -0.2, 0.2);
+  // Finger control: the robot walks to where your fingertip is; a quick swipe sends it all the way
+  // to that side. The target is remembered, so it keeps going (and stays) after you lower the finger.
+  if (robot.goalX === undefined) robot.goalX = robotBaseX();
+  if (pointer && robot.phase === 'idle') {
+    const sw = pointer.tipVx || 0;
+    if (Math.abs(sw) > W * 1.2) { robot.goalX = sw > 0 ? maxX : minX; robot.swipeT = 0.5; }
+    else if (!(robot.swipeT > 0)) robot.goalX = pointer.pts[8][0];
+    leanT = clamp((robot.goalX - robot.x) / (W * 0.8), -0.2, 0.2);
     if ((pointer.vy || 0) < -H * 1.6 && robot.jumpY === 0 && robot.jumpV === 0) robot.jumpV = -u * 14;
   }
+  robot.swipeT = (robot.swipeT || 0) - dt;
+  tx = robot.goalX;
   if (body && robot.phase === 'idle') {
-    tx = lerp(minX, maxX, clamp((body.rx - camL) / Math.max(1, camR - camL), 0, 1));
+    tx = robot.goalX = lerp(minX, maxX, clamp((body.rx - camL) / Math.max(1, camR - camL), 0, 1));
     crouchT = clamp((body.ry - H * 0.55) / (H * 0.3), 0, 1);
     const roll = Math.atan2(body.pts[9][0] - body.pts[0][0], -(body.pts[9][1] - body.pts[0][1]));   // hand tilt
     leanT = clamp(roll * 0.6, -0.45, 0.45);
@@ -1697,6 +1728,17 @@ function drawHands(ctx, dt) {
       ctx.beginPath(); ctx.arc(tip[0], tip[1], 7, 0, Math.PI * 2); ctx.fill();
       ctx.globalAlpha = A; ctx.fillStyle = '#fff';
       ctx.beginPath(); ctx.arc(tip[0], tip[1], 2.5, 0, Math.PI * 2); ctx.fill();
+    }
+    // finger lock: a spinning target on the fingertip whenever the pointing gesture is detected
+    if (isPointer(h)) {
+      const [px, py] = h.pts[8], r = 14 + Math.sin(clock * 8) * 2;
+      ctx.globalAlpha = A; ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2;
+      for (let q = 0; q < 4; q++) {
+        const a0 = clock * 4 + q * Math.PI / 2;
+        ctx.beginPath(); ctx.arc(px, py, r, a0, a0 + 0.9); ctx.stroke();
+      }
+      ctx.fillStyle = '#ffffff'; ctx.font = 'bold 11px Consolas, Menlo, monospace';
+      ctx.fillText('FINGER LOCK', px, py - r - 10);
     }
     // air-trails: the raised fingertip draws a fading neon line as it moves
     const now = performance.now();
