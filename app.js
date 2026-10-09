@@ -38,6 +38,7 @@ const DEFAULTS = {
   codeWidth: 36,       // code panel width, percent of screen
   codeRight: false,    // code panel on the right instead of the left
   robot: true,         // hand-controlled robot that punches the screen on a clap
+  scanlines: false,    // retro CRT scanlines + dark vignette over the picture
   particleCount: 900,  // shards on shatter (mesh has 852 triangles; more = subdivided)
   codeSpeed: 1,
   micTrigger: true,
@@ -116,7 +117,7 @@ let edgeX = 0;            // x of the panel's inner edge, where the hand beams s
 let camL = 0, camR = 0;   // the camera area not covered by the panel (HUD lives here)
 
 function resize() {
-  DPR = Math.min(window.devicePixelRatio || 1, 1.5);   // cap for performance
+  DPR = Math.min(window.devicePixelRatio || 1, 2);     // full sharpness on HiDPI screens (capped for speed)
   W = window.innerWidth; H = window.innerHeight;
 
   // Code panel on one side, fading into the camera at its inner edge.
@@ -149,7 +150,7 @@ let micAvailable = false;
 const view = { dx: 0, dy: 0, dw: 1, dh: 1 };
 
 async function startCamera() {
-  const videoC = { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 }, facingMode: 'user' };  // HD = clear picture
+  const videoC = { width: { ideal: 3840 }, height: { ideal: 2160 }, frameRate: { ideal: 30 }, facingMode: 'user' };  // ask for 4K; the browser gives the camera's best
   // Disable browser voice processing: noise suppression / AGC destroy clap transients.
   const audioC = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
   let stream;
@@ -1748,12 +1749,6 @@ function drawHUD(ctx) {
   const status = modelStatus || (!camReady ? 'AWAITING AUTHORIZATION' : '');
   if (status) {
     hudText(ctx, status, CX, H / 2 - 8, 'center', '#00e5ff', 18);
-  } else if (!locked) {
-    const R = Math.min(camR - camL, H) * 0.2, a = clock * 3;
-    ctx.strokeStyle = 'rgba(57,255,136,0.5)'; ctx.lineWidth = 1.5;
-    ctx.beginPath(); ctx.arc(CX, H / 2, R, a, a + 1.2); ctx.stroke();
-    ctx.beginPath(); ctx.arc(CX, H / 2, R * 0.7, -a * 1.3, -a * 1.3 + 0.8); ctx.stroke();
-    if (blink) hudText(ctx, 'SCANNING FOR TARGET...', CX, H / 2 - 10, 'center', '#ff3b6b', 20);
   }
 
   if (triggerBanner > 0) {
@@ -1869,7 +1864,11 @@ function bindSettings() {
   const pct = (v) => `${v}%`;
   const fmt = { sensitivity: (v) => v, camTint: pct, codeWidth: pct, particleCount: (v) => v, codeSpeed: (v) => `${Number(v).toFixed(1)}x` };
   const LAYOUT_KEYS = ['codeWidth', 'codeRight'];
+  const applyLook = () => {
+    for (const el of document.querySelectorAll('.scanlines, .vignette')) el.classList.toggle('hidden', !settings.scanlines);
+  };
   const sync = () => {
+    applyLook();
     for (const k of Object.keys(DEFAULTS)) {
       const el = document.getElementById(k);
       if (el.type === 'checkbox') el.checked = settings[k];
