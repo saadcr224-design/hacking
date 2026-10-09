@@ -38,6 +38,7 @@ const DEFAULTS = {
   codeWidth: 36,       // code panel width, percent of screen
   codeRight: false,    // code panel on the right instead of the left
   robot: true,         // hand-controlled robot that punches the screen on a clap
+  swapHands: false,    // false: right hand = robot arm, left hand = robot body
   scanlines: false,    // retro CRT scanlines + dark vignette over the picture
   particleCount: 900,  // shards on shatter (mesh has 852 triangles; more = subdivided)
   codeSpeed: 1,
@@ -378,6 +379,7 @@ function processHands(res, now) {
       prev.pts[k][0] += (raw[k][0] - prev.pts[k][0]) * 0.65;
       prev.pts[k][1] += (raw[k][1] - prev.pts[k][1]) * 0.65;
     }
+    prev.vy = lerp(prev.vy || 0, dt > 0.001 && dt < 0.3 ? (y - prev.ry) / dt : 0, 0.5);
     prev.rx = x; prev.ry = y; prev.t = now; prev.speed = lerp(prev.speed, speed, 0.5); prev.seen = true;
     prev.fist = isFist(raw);
   }
@@ -739,6 +741,9 @@ const robot = {
   // arm pose as a direction * extension (0..1) from the robot's shoulder, in robot space
   arms: { L: { x: -0.25, y: 0.92, fist: 0, live: false }, R: { x: 0.25, y: 0.92, fist: 0, live: false } },
   look: { x: 0, y: 0 },
+  vx: 0, walk: 0,                    // walking speed + stride phase
+  crouch: 0, lean: 0,                // 0..1 squat, torso lean (radians)
+  jumpY: 0, jumpV: 0,                // jump height (negative = up) and velocity
   phase: 'idle', pt: 0,              // idle | windup | punch | recover
   impact: { x: 0, y: 0 },
   onImpact: null,
@@ -753,15 +758,19 @@ function robotBaseX() {
   return settings.codeRight ? camL + u * 4.4 : camR - u * 4.4;
 }
 
-/** The hand that drives the robot's arm on each side (mirror view: your screen-left hand -> its screen-left arm). */
-function armHands() {
+/**
+ * Which of your hands does what. Mirror view: your right hand shows on the right of the screen.
+ *  - two hands: right hand -> robot arm, left hand -> robot body (walk / crouch / jump / lean)
+ *  - one hand: it drives the arm
+ * "Swap hands" in settings flips the roles.
+ */
+function handRoles() {
   const seen = hands.list.filter((h) => h.seen).sort((a, b) => a.rx - b.rx);
-  if (seen.length >= 2) return { L: seen[0], R: seen[seen.length - 1] };
-  if (seen.length === 1) {
-    const mid = face.present ? face.cx : (camL + camR) / 2;
-    return seen[0].rx < mid ? { L: seen[0], R: null } : { L: null, R: seen[0] };
+  if (seen.length >= 2) {
+    const left = seen[0], right = seen[seen.length - 1];
+    return settings.swapHands ? { arm: left, body: right } : { arm: right, body: left };
   }
-  return { L: null, R: null };
+  return { arm: seen[0] || null, body: null };
 }
 
 /** Start the punch; `onImpact` runs when the fist hits the glass. Returns false if busy. */
@@ -774,16 +783,39 @@ function robotPunch(onImpact) {
 }
 
 function updateRobot(dt) {
-  const fd = robotFacing();
-  const tx = robotBaseX() + (robot.phase !== 'idle' ? fd * robotUnit() * 1.2 : 0);
-  robot.x = robot.x ? lerp(robot.x, tx, 1 - Math.pow(0.002, dt)) : tx;
+  const u = robotUnit();
+  const { arm, body } = handRoles();
+  const minX = camL + u * 2.6, maxX = Math.max(minX, camR - u * 2.6);
+  if (!robot.x) robot.x = robotBaseX();
 
-  // Mirror your arms: direction from your (estimated) shoulder to your hand.
-  const hs = armHands();
+  // ---- body hand: walk (left/right), crouch (low), jump (flick up), lean (tilt) ----
+  let tx = robot.x, crouchT = 0, leanT = 0;
+  if (body && robot.phase === 'idle') {
+    tx = lerp(minX, maxX, clamp((body.rx - camL) / Math.max(1, camR - camL), 0, 1));
+    crouchT = clamp((body.ry - H * 0.55) / (H * 0.3), 0, 1);
+    const roll = Math.atan2(body.pts[9][0] - body.pts[0][0], -(body.pts[9][1] - body.pts[0][1]));   // hand tilt
+    leanT = clamp(roll * 0.6, -0.45, 0.45);
+    if ((body.vy || 0) < -H * 1.6 && robot.jumpY === 0 && robot.jumpV === 0) robot.jumpV = -u * 14;
+  }
+  tx = clamp(tx, minX, maxX);
+  const maxV = u * 9;
+  robot.vx = lerp(robot.vx, clamp((tx - robot.x) * 6, -maxV, maxV), 1 - Math.pow(0.001, dt));
+  robot.x = clamp(robot.x + robot.vx * dt, minX, maxX);
+  robot.walk += (Math.abs(robot.vx) * dt) / (u * 0.9);
+  robot.crouch = lerp(robot.crouch, crouchT, 1 - Math.pow(0.002, dt));
+  robot.lean = lerp(robot.lean, leanT + clamp(robot.vx / (u * 60), -0.1, 0.1), 1 - Math.pow(0.002, dt));
+  if (robot.jumpV || robot.jumpY) {           // jump physics
+    robot.jumpV += u * 40 * dt; robot.jumpY += robot.jumpV * dt;
+    if (robot.jumpY >= 0) { robot.jumpY = 0; robot.jumpV = 0; shake = Math.max(shake, 8); }
+  }
+
+  // ---- arm hand: the robot's matching arm mirrors it; the other arm swings while walking ----
+  const armKey = settings.swapHands ? 'L' : 'R';
   const k = 1 - Math.pow(0.0004, dt);
+  const swing = clamp(Math.abs(robot.vx) / (u * 3), 0, 1);
   for (const [key, side] of [['L', -1], ['R', 1]]) {
-    const A = robot.arms[key], h = hs[key];
-    let tx2 = side * 0.25, ty2 = 0.92, fist = 0;                       // relaxed, hanging
+    const A = robot.arms[key], h = key === armKey ? arm : null;
+    let tx2 = side * 0.25 + Math.sin(robot.walk * Math.PI + (side > 0 ? 0 : Math.PI)) * 0.3 * swing, ty2 = 0.92, fist = 0;
     if (h) {
       const fw = face.has ? face.w : W * 0.12;
       const sx = face.has ? face.cx + side * fw * 0.9 : (camL + camR) / 2 + side * W * 0.1;
@@ -795,9 +827,10 @@ function updateRobot(dt) {
     A.live = !!h;
     A.x += (tx2 - A.x) * k; A.y += (ty2 - A.y) * k; A.fist += (fist - A.fist) * k;
   }
-  const lh = hs.L || hs.R;
+  const lh = arm || body;
   robot.look.x = lh ? lh.rx : (face.present ? face.cx : (camL + camR) / 2);
   robot.look.y = lh ? lh.ry : (face.present ? face.cy : H * 0.4);
+  robot.bodyLive = !!body;
 
   if (robot.phase === 'idle') return;
   robot.pt += dt;
@@ -912,7 +945,9 @@ function drawRobot(ctx) {
   const angry = robot.phase !== 'idle';
   const eye = angry ? '#ff2a2a' : glow;
   const u = robotUnit() * robotScale();
-  const ox = robot.x, oy = robotGround() - 5.0 * u + Math.sin(clock * 2) * u * 0.03;   // torso origin, breathing
+  const drop = robot.crouch * 0.75 * u;                                                    // squat
+  const ox = robot.x, oy = robotGround() - 5.0 * u + drop + robot.jumpY + Math.sin(clock * 2) * u * 0.03;   // torso origin
+  const gy = 5.0 * u - drop - robot.jumpY;                                                 // ground, in body space
   const t = clock;
 
   ctx.save();
@@ -920,13 +955,22 @@ function drawRobot(ctx) {
   ctx.lineJoin = 'round';
 
   // ground shadow
-  const sg = ctx.createRadialGradient(0, 5.0 * u, 0, 0, 5.0 * u, 2.2 * u);
+  const shr = 2.2 * u * clamp(1 + robot.jumpY / (u * 5), 0.4, 1);
+  const sg = ctx.createRadialGradient(0, gy, 0, 0, gy, shr);
   sg.addColorStop(0, 'rgba(0,0,0,0.55)'); sg.addColorStop(1, 'rgba(0,0,0,0)');
-  ctx.fillStyle = sg; ctx.beginPath(); ctx.ellipse(0, 5.0 * u, 2.2 * u, 0.35 * u, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = sg; ctx.beginPath(); ctx.ellipse(0, gy, shr, 0.35 * u, 0, 0, Math.PI * 2); ctx.fill();
 
   // ---- legs ----
   for (const s of [-1, 1]) {
-    const hip = [s * 0.62 * u, 1.75 * u], knee = [s * 0.74 * u, 3.3 * u], ank = [s * 0.78 * u, 4.7 * u];
+    // feet stay on the ground (stepping while walking, tucked while jumping); knees solved with IK
+    const hip = [s * 0.62 * u, 1.75 * u];
+    const stride = clamp(Math.abs(robot.vx) / (u * 3), 0, 1);
+    const ph = robot.walk * Math.PI + (s > 0 ? 0 : Math.PI);
+    let ax = s * 0.8 * u + Math.sin(ph) * 0.45 * u * stride * Math.sign(robot.vx || 1);
+    let ay = gy - 0.3 * u - Math.max(0, Math.cos(ph)) * 0.35 * u * stride;
+    if (robot.jumpY < 0) { ax = s * 0.85 * u; ay = Math.min(ay, hip[1] + 2.6 * u); }
+    const leg = ik(hip[0], hip[1], ax, ay, 1.55 * u, 1.45 * u, s);
+    const knee = [leg.ex, leg.ey], ank = [leg.hx, leg.hy];
     limb(ctx, hip[0], hip[1], knee[0], knee[1], 0.85 * u, 0.62 * u, u, false, glow);
     limb(ctx, knee[0], knee[1], ank[0], ank[1], 0.7 * u, 0.5 * u, u, true, null);
     // hydraulic piston on the shin
@@ -938,12 +982,15 @@ function drawRobot(ctx) {
     ctx.strokeStyle = OUTLINE; ctx.lineWidth = Math.max(1, u * 0.05); ctx.stroke();
     ctx.fillStyle = glow; ctx.fillRect(knee[0] - 0.2 * u, knee[1] - 0.04 * u, 0.4 * u, 0.08 * u);
     // foot
-    ctx.fillStyle = metal(ctx, ank[0], 4.6 * u, ank[0], 5.05 * u, true);
+    ctx.fillStyle = metal(ctx, ank[0], ank[1] - 0.1 * u, ank[0], ank[1] + 0.35 * u, true);
     ctx.beginPath();
-    ctx.moveTo(ank[0] - 0.4 * u, 4.65 * u); ctx.lineTo(ank[0] + 0.4 * u, 4.65 * u);
-    ctx.lineTo(ank[0] + 0.62 * u, 5.0 * u); ctx.lineTo(ank[0] - 0.62 * u, 5.0 * u); ctx.closePath();
+    ctx.moveTo(ank[0] - 0.4 * u, ank[1] - 0.05 * u); ctx.lineTo(ank[0] + 0.4 * u, ank[1] - 0.05 * u);
+    ctx.lineTo(ank[0] + 0.62 * u, ank[1] + 0.3 * u); ctx.lineTo(ank[0] - 0.62 * u, ank[1] + 0.3 * u); ctx.closePath();
     ctx.fill(); ctx.strokeStyle = OUTLINE; ctx.stroke();
   }
+
+  // upper body leans around the pelvis
+  ctx.translate(0, 1.6 * u); ctx.rotate(robot.lean); ctx.translate(0, -1.6 * u);
 
   // ---- pelvis + abdomen ----
   ctx.fillStyle = metal(ctx, -1.2 * u, 1.2 * u, 1.2 * u, 2.0 * u, true);
@@ -1724,7 +1771,9 @@ function drawHUD(ctx) {
   hudText(ctx, `LAST TRIGGER: ${lastTriggerSrc}`, L0, H - m - lh, 'left', '#1fd1a5');
   if (settings.robot) {
     const A = robot.arms, arm = (a) => (a.live ? (a.fist > 0.5 ? 'FIST' : 'OPEN') : '--');
-    const rs = robot.phase !== 'idle' ? 'PUNCH!!' : (A.L.live || A.R.live) ? `MIRRORING  L:${arm(A.L)} R:${arm(A.R)}` : 'IDLE - RAISE YOUR HANDS';
+    const armA = A.L.live ? A.L : A.R.live ? A.R : null;
+    const rs = robot.phase !== 'idle' ? 'PUNCH!!'
+      : `ARM: ${armA ? arm(armA) : '--'}  BODY: ${robot.bodyLive ? (robot.jumpY < 0 ? 'JUMP' : robot.crouch > 0.5 ? 'CROUCH' : Math.abs(robot.vx) > 20 ? 'WALK' : 'READY') : '--'}`;
     hudText(ctx, `ROBOT: ${rs}`, L0, H - m - lh * 5, 'left', robot.phase !== 'idle' ? '#ff3b6b' : accent);
   }
 
